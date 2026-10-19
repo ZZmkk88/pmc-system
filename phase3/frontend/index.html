@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<!-- 移动端适配：viewport 让手机按设备宽度排版，不缩成小字 -->
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>PMC 系统 第三阶段</title>
+<style>
+*{box-sizing:border-box}
+body{font-family:PingFang SC,Microsoft YaHei,sans-serif;margin:0;padding:16px;background:#f7f7f7;color:#222}
+h1{font-size:22px;margin:8px 0}h2{font-size:18px;margin:14px 0 6px}
+.card{background:#fff;border:1px solid #ddd;border-radius:10px;padding:12px;margin:10px 0}
+.红{color:#fff;background:#d9534f;padding:2px 8px;border-radius:10px}
+.黄{color:#fff;background:#f0ad4e;padding:2px 8px;border-radius:10px}
+.绿{color:#fff;background:#5cb85c;padding:2px 8px;border-radius:10px}
+button{margin:4px;padding:10px 16px;font-size:15px;border-radius:8px;border:1px solid #ccc;background:#fff;cursor:pointer;min-height:44px}
+button.primary{background:#4472c4;color:#fff;border-color:#4472c4}
+input,select{padding:10px;font-size:15px;border:1px solid #ccc;border-radius:8px;min-height:44px;width:100%}
+.inline{display:flex;gap:8px;flex-wrap:wrap}.inline>*{flex:1 1 160px}
+pre{background:#f6f6f6;padding:10px;white-space:pre-wrap;word-break:break-all;overflow-x:auto;border-radius:8px;max-height:420px;overflow-y:auto}
+.table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+table{border-collapse:collapse;min-width:560px;width:100%}th,td{border:1px solid #ddd;padding:8px;text-align:left;font-size:14px;white-space:nowrap}
+th{background:#4472c4;color:#fff}
+.hidden{display:none}
+.hint{color:#666;font-size:13px}
+/* 小屏（手机）：单列、按钮撑满、字略放大 */
+@media (max-width:640px){
+  body{padding:10px}h1{font-size:20px}
+  button{width:100%;margin:4px 0}.inline>*{flex:1 1 100%}
+  .card{padding:10px}th,td{font-size:13px;padding:6px}
+}
+</style></head>
+<body>
+<h1>PMC 系统 第三阶段（生产物料控制）</h1>
+<p>大白话：管“缺啥料、买多少、什么时候买”。第三阶段：简单登录 + 智能补货 + 供应商自动推荐 + 助手查询 + 手机能用；税率默认 13%。</p>
+
+<!-- 登录区 -->
+<div class="card" id="loginCard">
+  <h2>登录</h2>
+  <p class="hint">默认账号 <b>admin / admin</b>，首次登录请点“改密码”换一个自己的密码。演示版登录，正式环境需换服务端鉴权（见 README）。</p>
+  <div class="inline">
+    <input id="username" value="admin" placeholder="用户名">
+    <input id="password" type="password" value="admin" placeholder="密码">
+  </div>
+  <div style="margin-top:8px">
+    <button class="primary" onclick="doLogin()">登录</button>
+    <button onclick="doLogout()">退出登录</button>
+  </div>
+  <div class="inline" style="margin-top:8px">
+    <input id="oldPw" type="password" placeholder="旧密码">
+    <input id="newPw" type="password" placeholder="新密码（至少6位）">
+    <button onclick="changePw()">改密码</button>
+  </div>
+  <p id="loginMsg" class="hint"></p>
+</div>
+
+<div id="app" class="hidden">
+  <p>当前用户：<b id="me"></b> <span id="mustChange" class="黄 hidden">首次登录，请先改密码</span></p>
+
+  <!-- 助手 -->
+  <div class="card">
+    <h2>助手查询（打字问，不用点菜单）</h2>
+    <div class="inline">
+      <input id="ask" placeholder="例如：查外壳还剩多少" onkeydown="if(event.key==='Enter')ask()">
+      <button class="primary" onclick="ask()" style="flex:0 0 120px">问助手</button>
+    </div>
+    <p class="hint">试试：<a href="#" onclick="setAsk('查外壳还剩多少');return false">查外壳还剩多少</a> ·
+      <a href="#" onclick="setAsk('哪些料需要补货');return false">哪些料需要补货</a> ·
+      <a href="#" onclick="setAsk('外壳找谁买最便宜');return false">外壳找谁买最便宜</a> ·
+      <a href="#" onclick="setAsk('采购单 PO-2026-0001 到哪了');return false">采购单 PO-2026-0001 到哪了</a></p>
+    <p id="askAns" style="font-size:16px"></p>
+  </div>
+
+  <!-- 看板 -->
+  <div class="card">
+    <h2>看板（红=有问题，黄=预警，绿=正常）</h2>
+    <button onclick="loadDash()">刷新看板</button>
+    <div id="dash"></div>
+  </div>
+
+  <!-- 补货 -->
+  <div class="card">
+    <h2>智能补货建议</h2>
+    <p class="hint">公式：再订货点 = 日均用量 × 提前期 + 安全库存；建议补货 = max(0, 安全库存×2 + 日均用量×提前期 − 可用量)。日均用量取近 30 天真实领料。</p>
+    <button onclick="show('/api/replenishment?only_needed=true')">只看需要补货的</button>
+    <button onclick="show('/api/replenishment')">看全部零件</button>
+    <button class="primary" onclick="genRepl()">补货一键生成采购单</button>
+  </div>
+
+  <!-- Excel 导入 -->
+  <div class="card">
+    <h2>Excel 导入（支持 WPS 的 .xlsx）</h2>
+    <p class="hint">先在“模拟表单”里拿模板/已填好数据。已填好文件有 4 页（零件/库存期初/采购/BOM），导入时“工作表”要填对应页名。</p>
+    <div class="inline">
+      <select id="impKind"><option value="parts">零件</option><option value="stock">库存期初</option><option value="purchase">采购</option><option value="bom">BOM</option><option value="supplier">供应商</option><option value="sales">销售单</option><option value="production">生产单</option></select>
+      <input id="impSheet" placeholder="工作表名（可空，如 BOM）">
+      <input id="impFile" type="file" accept=".xlsx">
+    </div>
+    <button class="primary" onclick="doImport()">上传导入</button>
+    <button onclick="window.open('/api/excel/template/parts')">下载零件模板</button>
+    <button onclick="window.open('/api/excel/template/stock')">下载库存模板</button>
+    <button onclick="window.open('/api/excel/template/purchase')">下载采购模板</button>
+  </div>
+
+  <!-- 快捷查询 -->
+  <div class="card">
+    <h2>快捷查询</h2>
+    <button onclick="show('/api/parts')">零件列表</button>
+    <button onclick="show('/api/stock/available')">可用量总览</button>
+    <button onclick="show('/api/purchase')">采购单</button>
+    <button onclick="show('/api/production')">生产单</button>
+    <button onclick="show('/api/sales')">销售单</button>
+    <button onclick="show('/api/approvals/pending')">我的待审批</button>
+    <button onclick="show('/api/finance/payables')">应付报表</button>
+    <button onclick="show('/api/reports/stock_balance')">报表：库存结存</button>
+    <button onclick="show('/api/audit-log?limit=50')">审计日志</button>
+    <button onclick="show('/api/suppliers/compare/RM-001')">比价：外壳</button>
+    <pre id="out">点按钮查看数据（JSON 格式）。</pre>
+  </div>
+</div>
+
+<script>
+function token(){return localStorage.getItem('pmc_token')||'';}
+function headers(){return {'Authorization':'Bearer '+token(),'Content-Type':'application/json'};}
+function setAsk(t){document.getElementById('ask').value=t;}
+async function doLogin(){
+  const r=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({username:document.getElementById('username').value,password:document.getElementById('password').value})});
+  const d=await r.json();
+  if(!r.ok){document.getElementById('loginMsg').textContent='登录失败：'+(d.detail||JSON.stringify(d));return;}
+  localStorage.setItem('pmc_token',d.token);
+  document.getElementById('loginMsg').textContent='登录成功，有效期至 '+d.expires_at;
+  document.getElementById('app').classList.remove('hidden');
+  document.getElementById('me').textContent=d.username+'（'+(d.roles||[]).join('、')+'）';
+  if(d.must_change_password)document.getElementById('mustChange').classList.remove('hidden');
+  loadDash();
+}
+async function doLogout(){
+  await fetch('/api/auth/logout',{method:'POST',headers:headers()});
+  localStorage.removeItem('pmc_token');
+  document.getElementById('app').classList.add('hidden');
+  document.getElementById('loginMsg').textContent='已退出登录';
+}
+async function changePw(){
+  const r=await fetch('/api/auth/change-password',{method:'POST',headers:headers(),
+    body:JSON.stringify({old_password:document.getElementById('oldPw').value,new_password:document.getElementById('newPw').value})});
+  const d=await r.json();
+  document.getElementById('loginMsg').textContent=r.ok?'密码已修改，请用新密码重新登录':'改密码失败：'+(d.detail||JSON.stringify(d));
+  if(r.ok)doLogout();
+}
+async function ask(){
+  const text=document.getElementById('ask').value.trim();
+  if(!text){document.getElementById('askAns').textContent='请先输入问题';return;}
+  const r=await fetch('/api/assistant/query',{method:'POST',headers:headers(),body:JSON.stringify({text})});
+  const d=await r.json();
+  document.getElementById('askAns').textContent=(r.ok?d.answer:'查询失败：'+(d.detail||JSON.stringify(d)));
+}
+async function loadDash(){
+  const r=await fetch('/api/dashboard',{headers:{'Authorization':'Bearer '+token()}});
+  if(!r.ok){document.getElementById('dash').textContent='看板加载失败（请先登录）：'+r.status;return;}
+  const d=await r.json();
+  let html='';
+  for(const k of ['replenishment','shortage','overdue_purchase','supplier_ranking','production_shortage']){
+    const b=d[k]; if(!b)continue;
+    html+='<div class="card"><b>'+b.title+'</b> <span class="'+b.status+'">'+b.status+'</span> 数量：'+b.count+'<br><small>'+JSON.stringify(b.items).slice(0,800)+'</small></div>';
+  }
+  document.getElementById('dash').innerHTML=html;
+}
+async function show(url){
+  const r=await fetch(url,{headers:{'Authorization':'Bearer '+token()}});
+  document.getElementById('out').textContent=url+'\n'+JSON.stringify(await r.json(),null,2).slice(0,6000);
+}
+async function genRepl(){
+  if(!confirm('按当前补货建议生成采购单？'))return;
+  const r=await fetch('/api/replenishment/generate-purchase-orders',{method:'POST',headers:headers(),body:JSON.stringify({})});
+  document.getElementById('out').textContent=JSON.stringify(await r.json(),null,2);
+  loadDash();
+}
+async function doImport(){
+  const f=document.getElementById('impFile').files[0];
+  if(!f){alert('请先选一个 .xlsx 文件');return;}
+  const kind=document.getElementById('impKind').value;
+  const sheet=document.getElementById('impSheet').value.trim();
+  const fd=new FormData(); fd.append('file',f);
+  let url='/api/excel/import/'+kind; if(sheet)url+='?sheet='+encodeURIComponent(sheet);
+  const r=await fetch(url,{method:'POST',headers:{'Authorization':'Bearer '+token()},body:fd});
+  document.getElementById('out').textContent=JSON.stringify(await r.json(),null,2);
+}
+// 已登录时直接进主页
+if(token()){document.getElementById('app').classList.remove('hidden');fetch('/api/auth/me',{headers:headers()}).then(r=>r.json()).then(d=>{document.getElementById('me').textContent=d.username+'（'+(d.roles||[]).join('、')+'）';if(d.must_change_password)document.getElementById('mustChange').classList.remove('hidden');});loadDash();}
+</script></body></html>

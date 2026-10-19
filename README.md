@@ -20,17 +20,19 @@ PMC = Production Material Control（生产物料控制）。
 - `mvp/`：MVP（最小验证法，大白话就是先做最小的、能证明核心能跑通的版本）。例子：小夜灯 100 个 → MRP → 采购含税 1380.86 → 到货入库 → 生产 → 成品 100。含验证报告。
 - `phase1/`：第一阶段完整版。BOM 多版本/对比/多层爆炸+循环检测、库存调拨/盘点/批次追溯、供应商比价、采购申请审批、MRP 手动调整、看板、Excel 导入导出。验证脚本 128 项通过。
 - `phase2/`：第二阶段。逐级领料修复（半成品不再虚增）、按批次冻结、数据库序列单号、多公司/多仓库/多币种、金额分级审批、财务对账、权限 RBAC、报表+审计。验证脚本 176 项通过。
+- `phase3/`：第三阶段（智能 + 落地收尾）。智能补货建议（再订货点公式）、供应商自动比价 + 自动推荐（按推荐供应商分组生成采购单）、助手查询（关键词 + 规则解析，不用大模型猜）、移动端适配、登录（Token，替代演示身份 X-User）、模拟表单（3 个模板 + 1 份已填好数据）+ 《怎么用.md》。验证脚本 133 项通过。**推荐从这里开始用，见 `phase3/怎么用.md`。**
 
-## 怎么跑（以 phase2 为例，其他阶段同理）
+## 怎么跑（以 phase3 为例，推荐，其他阶段同理）
 
 ```bash
-cd phase2
+cd phase3
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python backend/test_phase2.py
-# 预期：全部第二阶段验证通过 ✅（共 176 项）
+.venv/bin/python backend/test_phase3.py
+# 预期：全部第三阶段验证通过 ✅（共 133 项）
 
 .venv/bin/uvicorn backend.app:app --reload --port 8000
-# 打开 http://localhost:8000
+# 打开 http://localhost:8000，默认账号 admin / admin，首次登录请改密码
+# 详细操作见 phase3/怎么用.md（含模拟表单测试全流程）
 ```
 
 Docker：
