@@ -1,189 +1,571 @@
 <!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="utf-8">
-<!-- 移动端适配：viewport 让手机按设备宽度排版，不缩成小字 -->
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>PMC 系统 第三阶段</title>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PMC 生产物料控制系统</title>
 <style>
-*{box-sizing:border-box}
-body{font-family:PingFang SC,Microsoft YaHei,sans-serif;margin:0;padding:16px;background:#f7f7f7;color:#222}
-h1{font-size:22px;margin:8px 0}h2{font-size:18px;margin:14px 0 6px}
-.card{background:#fff;border:1px solid #ddd;border-radius:10px;padding:12px;margin:10px 0}
-.红{color:#fff;background:#d9534f;padding:2px 8px;border-radius:10px}
-.黄{color:#fff;background:#f0ad4e;padding:2px 8px;border-radius:10px}
-.绿{color:#fff;background:#5cb85c;padding:2px 8px;border-radius:10px}
-button{margin:4px;padding:10px 16px;font-size:15px;border-radius:8px;border:1px solid #ccc;background:#fff;cursor:pointer;min-height:44px}
-button.primary{background:#4472c4;color:#fff;border-color:#4472c4}
-input,select{padding:10px;font-size:15px;border:1px solid #ccc;border-radius:8px;min-height:44px;width:100%}
-.inline{display:flex;gap:8px;flex-wrap:wrap}.inline>*{flex:1 1 160px}
-pre{background:#f6f6f6;padding:10px;white-space:pre-wrap;word-break:break-all;overflow-x:auto;border-radius:8px;max-height:420px;overflow-y:auto}
-.table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
-table{border-collapse:collapse;min-width:560px;width:100%}th,td{border:1px solid #ddd;padding:8px;text-align:left;font-size:14px;white-space:nowrap}
-th{background:#4472c4;color:#fff}
-.hidden{display:none}
-.hint{color:#666;font-size:13px}
-/* 小屏（手机）：单列、按钮撑满、字略放大 */
-@media (max-width:640px){
-  body{padding:10px}h1{font-size:20px}
-  button{width:100%;margin:4px 0}.inline>*{flex:1 1 100%}
-  .card{padding:10px}th,td{font-size:13px;padding:6px}
-}
-</style></head>
+  :root{--blue:#2563eb;--green:#16a34a;--yellow:#d97706;--red:#dc2626;--bg:#f4f6fb;--card:#fff;--line:#e5e7eb;--text:#1f2937;--muted:#6b7280}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);font-size:14px}
+  header{background:#0f172a;color:#fff;padding:10px 16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  header h1{font-size:16px;margin:0}
+  header .spacer{flex:1}
+  button{cursor:pointer;border:1px solid var(--line);background:#fff;border-radius:6px;padding:6px 10px;font-size:13px}
+  button:hover{border-color:var(--blue);color:var(--blue)}
+  button.primary{background:var(--blue);border-color:var(--blue);color:#fff}
+  button.primary:hover{opacity:.9;color:#fff}
+  button.small{padding:2px 8px;font-size:12px}
+  nav{display:flex;gap:6px;padding:10px 16px;background:#fff;border-bottom:1px solid var(--line);flex-wrap:wrap}
+  nav button.active{background:var(--blue);color:#fff;border-color:var(--blue)}
+  main{padding:16px;max-width:1280px;margin:0 auto}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:14px;box-shadow:0 1px 2px rgba(0,0,0,.03)}
+  .card h3{margin:0 0 10px;font-size:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .badge{font-size:12px;padding:1px 8px;border-radius:10px;border:1px solid}
+  .b-red{color:var(--red);border-color:#fecaca;background:#fef2f2}
+  .b-yellow{color:var(--yellow);border-color:#fde68a;background:#fffbeb}
+  .b-green{color:var(--green);border-color:#bbf7d0;background:#f0fdf4}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin-bottom:10px}
+  .grid label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--muted)}
+  input,select,textarea{padding:6px 8px;border:1px solid var(--line);border-radius:6px;font-size:13px;font-family:inherit}
+  textarea{min-height:60px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{padding:6px 8px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
+  th{color:var(--muted);font-weight:500;background:#fafafa}
+  tbody tr:hover{background:#f8fafc}
+  .scroll{overflow:auto;max-height:460px}
+  .muted{color:var(--muted);font-size:12px}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .msg{margin:8px 0;font-size:13px}
+  .msg.err{color:var(--red)} .msg.ok{color:var(--green)}
+  #login{position:fixed;inset:0;background:linear-gradient(135deg,#eef2ff,#f8fafc);display:flex;align-items:center;justify-content:center;z-index:9}
+  #login .card{width:340px;padding:22px}
+  #login h2{margin:0 0 4px;font-size:18px}
+  .hidden{display:none!important}
+  @media (max-width:640px){
+    main{padding:10px}
+    header h1{font-size:14px}
+    table{font-size:12px}
+    th,td{padding:4px 6px}
+    .grid{grid-template-columns:1fr}
+  }
+</style>
+</head>
 <body>
-<h1>PMC 系统 第三阶段（生产物料控制）</h1>
-<p>大白话：管“缺啥料、买多少、什么时候买”。第三阶段：简单登录 + 智能补货 + 供应商自动推荐 + 助手查询 + 手机能用；税率默认 13%。</p>
 
-<!-- 登录区 -->
-<div class="card" id="loginCard">
-  <h2>登录</h2>
-  <p class="hint">默认账号 <b>admin / admin</b>，首次登录请点“改密码”换一个自己的密码。演示版登录，正式环境需换服务端鉴权（见 README）。</p>
-  <div class="inline">
-    <input id="username" value="admin" placeholder="用户名">
-    <input id="password" type="password" value="admin" placeholder="密码">
+<div id="login">
+  <div class="card">
+    <h2>PMC 生产物料控制系统</h2>
+    <p class="muted">登录后使用（默认账号 admin/admin）</p>
+    <div class="grid" style="grid-template-columns:1fr">
+      <label>账号<input id="lg-user" autocomplete="username" placeholder="admin"></label>
+      <label>密码<input id="lg-pass" type="password" autocomplete="current-password" placeholder="admin"></label>
+    </div>
+    <div class="row"><button class="primary" onclick="doLogin()">登录</button><button onclick="showHelp()">怎么用</button></div>
+    <div id="lg-msg" class="msg"></div>
   </div>
-  <div style="margin-top:8px">
-    <button class="primary" onclick="doLogin()">登录</button>
-    <button onclick="doLogout()">退出登录</button>
-  </div>
-  <div class="inline" style="margin-top:8px">
-    <input id="oldPw" type="password" placeholder="旧密码">
-    <input id="newPw" type="password" placeholder="新密码（至少6位）">
-    <button onclick="changePw()">改密码</button>
-  </div>
-  <p id="loginMsg" class="hint"></p>
 </div>
 
-<div id="app" class="hidden">
-  <p>当前用户：<b id="me"></b> <span id="mustChange" class="黄 hidden">首次登录，请先改密码</span></p>
+<header class="hidden" id="topbar">
+  <h1>PMC 生产物料控制</h1>
+  <span class="spacer"></span>
+  <span id="who" class="muted" style="color:#cbd5e1"></span>
+  <button class="small" onclick="logout()">退出</button>
+</header>
 
-  <!-- 助手 -->
-  <div class="card">
-    <h2>助手查询（打字问，不用点菜单）</h2>
-    <div class="inline">
-      <input id="ask" placeholder="例如：查外壳还剩多少" onkeydown="if(event.key==='Enter')ask()">
-      <button class="primary" onclick="ask()" style="flex:0 0 120px">问助手</button>
-    </div>
-    <p class="hint">试试：<a href="#" onclick="setAsk('查外壳还剩多少');return false">查外壳还剩多少</a> ·
-      <a href="#" onclick="setAsk('哪些料需要补货');return false">哪些料需要补货</a> ·
-      <a href="#" onclick="setAsk('外壳找谁买最便宜');return false">外壳找谁买最便宜</a> ·
-      <a href="#" onclick="setAsk('采购单 PO-2026-0001 到哪了');return false">采购单 PO-2026-0001 到哪了</a></p>
-    <p id="askAns" style="font-size:16px"></p>
-  </div>
+<nav class="hidden" id="nav"></nav>
 
-  <!-- 看板 -->
-  <div class="card">
-    <h2>看板（红=有问题，黄=预警，绿=正常）</h2>
-    <button onclick="loadDash()">刷新看板</button>
-    <div id="dash"></div>
-  </div>
-
-  <!-- 补货 -->
-  <div class="card">
-    <h2>智能补货建议</h2>
-    <p class="hint">公式：再订货点 = 日均用量 × 提前期 + 安全库存；建议补货 = max(0, 安全库存×2 + 日均用量×提前期 − 可用量)。日均用量取近 30 天真实领料。</p>
-    <button onclick="show('/api/replenishment?only_needed=true')">只看需要补货的</button>
-    <button onclick="show('/api/replenishment')">看全部零件</button>
-    <button class="primary" onclick="genRepl()">补货一键生成采购单</button>
-  </div>
-
-  <!-- Excel 导入 -->
-  <div class="card">
-    <h2>Excel 导入（支持 WPS 的 .xlsx）</h2>
-    <p class="hint">先在“模拟表单”里拿模板/已填好数据。已填好文件有 4 页（零件/库存期初/采购/BOM），导入时“工作表”要填对应页名。</p>
-    <div class="inline">
-      <select id="impKind"><option value="parts">零件</option><option value="stock">库存期初</option><option value="purchase">采购</option><option value="bom">BOM</option><option value="supplier">供应商</option><option value="sales">销售单</option><option value="production">生产单</option></select>
-      <input id="impSheet" placeholder="工作表名（可空，如 BOM）">
-      <input id="impFile" type="file" accept=".xlsx">
-    </div>
-    <button class="primary" onclick="doImport()">上传导入</button>
-    <button onclick="window.open('/api/excel/template/parts')">下载零件模板</button>
-    <button onclick="window.open('/api/excel/template/stock')">下载库存模板</button>
-    <button onclick="window.open('/api/excel/template/purchase')">下载采购模板</button>
-  </div>
-
-  <!-- 快捷查询 -->
-  <div class="card">
-    <h2>快捷查询</h2>
-    <button onclick="show('/api/parts')">零件列表</button>
-    <button onclick="show('/api/stock/available')">可用量总览</button>
-    <button onclick="show('/api/purchase')">采购单</button>
-    <button onclick="show('/api/production')">生产单</button>
-    <button onclick="show('/api/sales')">销售单</button>
-    <button onclick="show('/api/approvals/pending')">我的待审批</button>
-    <button onclick="show('/api/finance/payables')">应付报表</button>
-    <button onclick="show('/api/reports/stock_balance')">报表：库存结存</button>
-    <button onclick="show('/api/audit-log?limit=50')">审计日志</button>
-    <button onclick="show('/api/suppliers/compare/RM-001')">比价：外壳</button>
-    <pre id="out">点按钮查看数据（JSON 格式）。</pre>
-  </div>
-</div>
+<main class="hidden" id="view"></main>
 
 <script>
-function token(){return localStorage.getItem('pmc_token')||'';}
-function headers(){return {'Authorization':'Bearer '+token(),'Content-Type':'application/json'};}
-function setAsk(t){document.getElementById('ask').value=t;}
+/* ---------- 基础 ---------- */
+const S = { token: localStorage.getItem('pmc_token') || '', user: null, page: 'dashboard', report: 'stock_balance' };
+const $ = id => document.getElementById(id);
+function esc(v){ return String(v==null?'':v).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+let FLASH = null;
+function setMsg(where, text, ok){ const b = $(where); if(b){ b.className = 'msg ' + (ok?'ok':'err'); b.textContent = text; } }
+function msg(text, ok){
+  FLASH = {text:text, ok:ok};
+  setMsg($('view-msg') ? 'view-msg' : 'lg-msg', text, ok);
+  // 操作成功后会立刻刷新列表（view 重绘会清掉提示），这里在重绘后把提示补回去
+  setTimeout(function(){ if(FLASH && $('view-msg')) setMsg('view-msg', FLASH.text, FLASH.ok); }, 0);
+}
+async function api(path, opt={}){
+  const o = { method: opt.method || 'GET', headers: {} };
+  if(S.token) o.headers['Authorization'] = 'Bearer ' + S.token;
+  if(opt.form){ o.body = opt.form; }
+  else if(opt.body !== undefined){ o.headers['Content-Type'] = 'application/json'; o.body = JSON.stringify(opt.body); }
+  const r = await fetch(path, o);
+  if(r.status === 401){ logout(true); throw new Error('登录已过期，请重新登录'); }
+  const ct = r.headers.get('content-type') || '';
+  if(ct.includes('spreadsheet') || ct.includes('octet-stream')) return r;
+  const text = await r.text(); let data;
+  try{ data = JSON.parse(text); }catch(e){ data = text; }
+  if(!r.ok){ const d = data && data.detail; throw new Error(typeof d === 'string' ? d : JSON.stringify(d || data)); }
+  return data;
+}
+function table(rows, cols){
+  if(!rows || !rows.length) return '<p class="muted">暂无数据</p>';
+  let h = '<div class="scroll"><table><thead><tr>' + cols.map(c=>'<th>'+esc(c.label)+'</th>').join('') + '</tr></thead><tbody>';
+  for(const row of rows){
+    h += '<tr>' + cols.map(c=>{
+      if(c.html && typeof c.get === 'function') return '<td>'+c.get(row)+'</td>';
+      let v = typeof c.get === 'function' ? c.get(row) : row[c.k];
+      const raw = (v == null || v === '') ? '' : v;
+      if(c.badge){ const cls = raw==='红'?'b-red':(raw==='黄'?'b-yellow':'b-green'); return '<td><span class="badge '+cls+'">'+esc(raw)+'</span></td>'; }
+      return '<td>'+esc(raw)+'</td>';
+    }).join('') + '</tr>';
+  }
+  return h + '</tbody></table></div>';
+}
+function card(title, body, extra){ return '<div class="card"><h3>'+title+(extra||'')+'</h3>'+body+'</div>'; }
+function formRow(id, fields, submitText, submitCall){
+  let h = '<div class="grid">';
+  for(const f of fields){
+    h += '<label>'+esc(f.label);
+    if(f.type === 'select'){ h += '<select id="'+id+'-'+f.k+'">'+f.options.map(o=>'<option value="'+esc(o)+'">'+esc(o)+'</option>').join('')+'</select>'; }
+    else h += '<input id="'+id+'-'+f.k+'" placeholder="'+esc(f.ph||'')+'" value="'+esc(f.value||'')+'">';
+    h += '</label>';
+  }
+  return h + '</div><button class="primary" onclick="'+submitCall+'(\''+id+'\')">'+esc(submitText)+'</button>';
+}
+function fval(id, key){ const e = $(id+'-'+key); return e ? e.value.trim() : ''; }
+function numOr0(v){ const n = parseFloat(v); return isNaN(n) ? 0 : n; }
+
+/* ---------- 登录/登出 ---------- */
 async function doLogin(){
-  const r=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({username:document.getElementById('username').value,password:document.getElementById('password').value})});
-  const d=await r.json();
-  if(!r.ok){document.getElementById('loginMsg').textContent='登录失败：'+(d.detail||JSON.stringify(d));return;}
-  localStorage.setItem('pmc_token',d.token);
-  document.getElementById('loginMsg').textContent='登录成功，有效期至 '+d.expires_at;
-  document.getElementById('app').classList.remove('hidden');
-  document.getElementById('me').textContent=d.username+'（'+(d.roles||[]).join('、')+'）';
-  if(d.must_change_password)document.getElementById('mustChange').classList.remove('hidden');
-  loadDash();
+  const u = $('lg-user').value.trim() || 'admin';
+  const p = $('lg-pass').value || u;
+  S._oldPass = p;
+  try{
+    const d = await api('/api/auth/login', {method:'POST', body:{username:u, password:p}});
+    S.token = d.token; localStorage.setItem('pmc_token', d.token); S.user = d.username || u;
+    if(d.must_change_password){ renderChangePassword(); return; }
+    setMsg('lg-msg','登录成功',true);
+    enterApp();
+  }catch(e){ setMsg('lg-msg','登录失败：'+e.message,false); }
 }
-async function doLogout(){
-  await fetch('/api/auth/logout',{method:'POST',headers:headers()});
-  localStorage.removeItem('pmc_token');
-  document.getElementById('app').classList.add('hidden');
-  document.getElementById('loginMsg').textContent='已退出登录';
+function renderChangePassword(){
+  $('login').classList.remove('hidden');
+  $('login').innerHTML = '<div class="card"><h2>首次登录，请先改密码</h2>'+
+    '<p class="muted">管理员初始密码需修改后才能使用系统</p>'+
+    '<div class="grid" style="grid-template-columns:1fr">'+
+    '<label>新密码（至少 6 位）<input id="cp-1" type="password"></label>'+
+    '<label>再输一次<input id="cp-2" type="password"></label></div>'+
+    '<div class="row"><button class="primary" onclick="changePassword()">确认修改</button></div>'+
+    '<div id="lg-msg" class="msg"></div></div>';
 }
-async function changePw(){
-  const r=await fetch('/api/auth/change-password',{method:'POST',headers:headers(),
-    body:JSON.stringify({old_password:document.getElementById('oldPw').value,new_password:document.getElementById('newPw').value})});
-  const d=await r.json();
-  document.getElementById('loginMsg').textContent=r.ok?'密码已修改，请用新密码重新登录':'改密码失败：'+(d.detail||JSON.stringify(d));
-  if(r.ok)doLogout();
+async function changePassword(){
+  const a = $('cp-1').value, b = $('cp-2').value;
+  if(a.length < 6) return setMsg('lg-msg','新密码至少 6 位',false);
+  if(a !== b) return setMsg('lg-msg','两次输入不一致',false);
+  try{
+    await api('/api/auth/change-password', {method:'POST', body:{old_password:S._oldPass||'', new_password:a}});
+    setMsg('lg-msg','密码已修改，请重新登录',true);
+    setTimeout(()=>{ localStorage.removeItem('pmc_token'); location.reload(); }, 900);
+  }catch(e){ setMsg('lg-msg','改密失败：'+e.message,false); }
+}
+function logout(force){
+  if(!force && S.token){ api('/api/auth/logout',{method:'POST'}).catch(()=>{}); }
+  S.token=''; localStorage.removeItem('pmc_token'); S.user=null;
+  location.reload();
+}
+async function enterApp(){
+  $('login').classList.add('hidden');
+  $('topbar').classList.remove('hidden'); $('nav').classList.remove('hidden'); $('view').classList.remove('hidden');
+  try{ const me = await api('/api/auth/me'); S.user = me.username || me.user || S.user; }catch(e){}
+  $('who').textContent = '当前用户：' + (S.user || '');
+  buildNav(); show('dashboard');
+}
+
+/* ---------- 导航 ---------- */
+const PAGES = [
+  ['dashboard','看板'],['parts','零件'],['stock','库存'],['purchase','采购'],['production','生产'],
+  ['sales','销售'],['mrp','MRP 运算'],['replenishment','智能补货'],['reports','报表'],['audit','审计日志'],
+  ['data','导入导出'],['assistant','助手查询']
+];
+function buildNav(){
+  $('nav').innerHTML = PAGES.map(function(p){ return '<button data-page="'+p[0]+'" onclick="show(\''+p[0]+'\')">'+p[1]+'</button>'; }).join('');
+}
+function show(page){
+  S.page = page;
+  FLASH = null;
+  document.querySelectorAll('#nav button').forEach(function(b){ b.classList.toggle('active', b.dataset.page===page); });
+  $('view').innerHTML = '<div id="view-msg" class="msg"></div><p class="muted">加载中…</p>';
+  const fns = {dashboard:pageDashboard, parts:pageParts, stock:pageStock, purchase:pagePurchase, production:pageProduction,
+    sales:pageSales, mrp:pageMrp, replenishment:pageReplenishment, reports:pageReports, audit:pageAudit,
+    data:pageData, assistant:pageAssistant};
+  (fns[page] || pageDashboard)();
+}
+
+/* ---------- 看板 ---------- */
+const DASH_LABELS = {part_code:'编码', part_name:'名称', unit:'单位', available:'可用', onhand:'现有',
+  daily_avg_usage:'日均用量', usage_days:'统计天数', has_usage_history:'有历史', lead_time_days:'提前期(天)',
+  safety_stock:'安全库存', max_stock:'最高库存', status:'状态', reason:'原因', suggested_qty:'建议补货量',
+  recommended_supplier:'推荐供应商', supplier_code:'供应商', order_no:'单号', po_no:'采购单',
+  due_date:'交期', delay_days:'拖期(天)', days_late:'拖期(天)', overdue_days:'拖期(天)',
+  product_code:'产品', mo_no:'生产单', order_qty:'订单数量', qty:'数量', shortage_qty:'缺口',
+  supplier_name:'供应商名称', delay_count:'拖期次数', score:'评分'};
+async function pageDashboard(){
+  try{
+    const d = await api('/api/dashboard');
+    let h = '';
+    const blocks = [d.replenishment, d.shortage, d.overdue_purchase, d.supplier_ranking, d.production_shortage];
+    for(const b of blocks){
+      if(!b) continue;
+      const cls = b.status==='红'?'b-red':(b.status==='黄'?'b-yellow':'b-green');
+      let body = '<p class="muted">暂无</p>';
+      if(b.items && b.items.length){
+        const keys = Object.keys(b.items[0]).slice(0, 8);
+        body = table(b.items, keys.map(k=>({k:k, label:DASH_LABELS[k] || k})));
+      }
+      h += card(esc(b.title||'') + ' <span class="badge '+cls+'">'+esc(b.status||'')+' · '+esc(b.count||0)+' 条</span>', body);
+    }
+    h += card('快捷操作','<div class="row"><button onclick="show(\'sales\')">开销售单</button><button onclick="show(\'mrp\')">跑 MRP</button><button onclick="show(\'purchase\')">开采购单</button><button onclick="show(\'production\')">开生产单</button></div>');
+    $('view').innerHTML = '<div id="view-msg" class="msg"></div>' + h;
+  }catch(e){ $('view').innerHTML = '<div class="msg err">看板加载失败：'+esc(e.message)+'</div>'; }
+}
+
+/* ---------- 零件 ---------- */
+async function pageParts(){
+  try{
+    const parts = await api('/api/parts');
+    const cols = [
+      {k:'code',label:'编码'},{k:'name',label:'名称'},{k:'spec',label:'规格'},{k:'unit',label:'单位'},
+      {k:'category',label:'类别'},{k:'safety_stock',label:'安全库存'},{k:'max_stock',label:'最高库存'},
+      {k:'lead_time_days',label:'提前期(天)'},{k:'price',label:'单价'},{k:'tax_rate',label:'税率'},{k:'company_code',label:'公司'}
+    ];
+    const form = formRow('pf', [
+      {k:'code',label:'零件编码',ph:'RM-100'},{k:'name',label:'名称',ph:'外壳'},{k:'spec',label:'规格',ph:'ABS'},
+      {k:'unit',label:'单位',value:'个'},{k:'category',label:'类别',value:'原材料'},
+      {k:'safety_stock',label:'安全库存',value:'0'},{k:'max_stock',label:'最高库存',value:'0'},
+      {k:'lead_time_days',label:'提前期(天)',value:'7'},{k:'price',label:'单价',value:'0'},
+      {k:'tax_rate',label:'税率',value:'0.13'},{k:'company_code',label:'公司',value:'COMP-001'}
+    ], '新建零件', 'submitPart');
+    $('view').innerHTML = '<div id="view-msg" class="msg"></div>' + card('零件列表（共 '+parts.length+' 条）', table(parts, cols)) + card('新建零件', form);
+  }catch(e){ $('view').innerHTML = '<div id="view-msg" class="msg err">零件加载失败：'+esc(e.message)+'</div>'; }
+}
+async function submitPart(id){
+  const body = {code:fval(id,'code'), name:fval(id,'name'), spec:fval(id,'spec'), unit:fval(id,'unit')||'个',
+    category:fval(id,'category')||'原材料', safety_stock:numOr0(fval(id,'safety_stock')), max_stock:numOr0(fval(id,'max_stock')),
+    lead_time_days:parseInt(fval(id,'lead_time_days')||'7', 10), price:numOr0(fval(id,'price')),
+    tax_rate:numOr0(fval(id,'tax_rate')||'0.13'), company_code:fval(id,'company_code')||'COMP-001'};
+  try{ await api('/api/parts',{method:'POST',body:body}); msg('零件已创建',true); pageParts(); }
+  catch(e){ msg('创建失败：'+e.message,false); }
+}
+
+/* ---------- 库存 ---------- */
+async function pageStock(){
+  try{
+    const rows = await api('/api/stock/available');
+    const cols = [
+      {k:'part_code',label:'编码'},{k:'part_name',label:'名称'},{k:'onhand',label:'现有'},
+      {k:'in_transit',label:'在途'},{k:'allocated',label:'已分配'},{k:'frozen',label:'冻结'},
+      {k:'available',label:'可用'},{k:'safety_stock',label:'安全库存'},{k:'status',label:'状态',badge:true}
+    ];
+    const inForm = formRow('stin', [{k:'part_code',label:'零件编码'},{k:'qty',label:'数量',value:'1'},
+      {k:'warehouse',label:'仓库',value:'主仓'},{k:'batch',label:'批次(可空)',ph:'BATCH-20261019'}], '入库', 'submitStockIn');
+    const outForm = formRow('stout', [{k:'part_code',label:'零件编码'},{k:'qty',label:'数量',value:'1'},
+      {k:'warehouse',label:'仓库',value:'主仓'},{k:'batch',label:'批次(可空)'}], '出库', 'submitStockOut');
+    $('view').innerHTML = '<div id="view-msg" class="msg"></div>' + card('库存可用量总览', table(rows, cols)) +
+      card('入库', inForm) + card('出库', outForm);
+  }catch(e){ $('view').innerHTML = '<div id="view-msg" class="msg err">库存加载失败：'+esc(e.message)+'</div>'; }
+}
+async function submitStockIn(id){
+  try{
+    await api('/api/stock/in',{method:'POST',body:{part_code:fval(id,'part_code'), qty:fval(id,'qty'),
+      warehouse:fval(id,'warehouse')||'主仓', batch:fval(id,'batch')||undefined}});
+    msg('入库成功',true); pageStock();
+  }catch(e){ msg('入库失败：'+e.message,false); }
+}
+async function submitStockOut(id){
+  try{
+    await api('/api/stock/out',{method:'POST',body:{part_code:fval(id,'part_code'), qty:fval(id,'qty'),
+      warehouse:fval(id,'warehouse')||'主仓', batch:fval(id,'batch')||undefined}});
+    msg('出库成功',true); pageStock();
+  }catch(e){ msg('出库失败：'+e.message,false); }
+}
+
+/* ---------- 采购 ---------- */
+async function pagePurchase(){
+  try{
+    const list = await api('/api/purchase');
+    const rows = list.map(function(o){
+      const it = o.items || [];
+      return Object.assign({}, o, {items_text: it.map(function(i){ return i.part_code+'×'+i.qty; }).join(' ')});
+    });
+    const cols = [
+      {k:'order_no',label:'单号'},{k:'supplier_code',label:'供应商'},{k:'status',label:'状态'},
+      {k:'total_amount',label:'总额'},{k:'warehouse',label:'仓库'},{k:'due_date',label:'交期'},
+      {k:'items_text',label:'明细',get:function(r){ return (r.items_text||'').slice(0,40); }}
+    ];
+    const actionCol = {label:'操作', html:true, get:function(r){
+      const st = r.status || '';
+      let b = '';
+      if(st === '新建' || st === '待审批'){
+        b += '<button class="small" onclick="approvePo(\''+r.order_no+'\')">审批</button> ';
+      }
+      if(st === '已审批' || st === '已下单' || st === '部分到货'){
+        b += '<button class="small" onclick="fillReceive(\''+r.order_no+'\')">到货</button>';
+      }
+      return b || '<span class="muted">—</span>'; }};
+    const newForm = formRow('po', [{k:'supplier_code',label:'供应商编码',value:'SUP-001'},
+      {k:'due_date',label:'交期',value:'2026-12-31'},{k:'warehouse',label:'仓库',value:'主仓'},
+      {k:'items',label:'明细（每行：零件编码,数量,单价）',ph:'RM-001,10,2.5'}], '新建采购单', 'submitPo');
+    const poOptions = rows.length ? rows.map(function(r){ return r.order_no; }) : [''];
+    const recvForm = formRow('rcv', [{k:'order_no',label:'采购单号',type:'select',options:poOptions},
+      {k:'part_code',label:'到货零件编码',ph:'RM-001'},{k:'qty',label:'到货数量',value:'1'},
+      {k:'qc_result',label:'质检结果',type:'select',options:['合格','不合格']}], '到货入库', 'submitReceive');
+    $('view').innerHTML = '<div id="view-msg" class="msg"></div>' +
+      card('采购单（共 '+list.length+' 张）', table(rows, cols.concat([actionCol]))) +
+      card('到货入库', recvForm) + card('新建采购单', newForm);
+  }catch(e){ $('view').innerHTML = '<div id="view-msg" class="msg err">采购单加载失败：'+esc(e.message)+'</div>'; }
+}
+async function submitPo(id){
+  const lines = fval(id,'items').split('\n').map(function(x){ return x.trim(); }).filter(Boolean);
+  const items = lines.map(function(line){
+    const p = line.split(',').map(function(s){ return s.trim(); });
+    return {part_code:p[0], qty:numOr0(p[1]), price:numOr0(p[2])};
+  });
+  if(!items.length) return msg('请填写明细，每行：零件编码,数量,单价',false);
+  try{
+    const d = await api('/api/purchase',{method:'POST',body:{supplier_code:fval(id,'supplier_code')||'SUP-001',
+      due_date:fval(id,'due_date')||undefined, warehouse:fval(id,'warehouse')||'主仓', items:items}});
+    msg('采购单已创建：'+d.order_no+'，含税合计 '+d.total_amount,true); pagePurchase();
+  }catch(e){ msg('创建失败：'+e.message,false); }
+}
+async function approvePo(no){
+  try{ await api('/api/purchase/'+no+'/approve',{method:'POST',body:{}}); msg(no+' 已审批通过',true); pagePurchase(); }
+  catch(e){ msg('审批失败：'+e.message,false); }
+}
+function fillReceive(no){
+  const s = $('rcv-order_no'); if(s) s.value = no;
+  const p = $('rcv-part_code');
+  if(p){ p.focus(); p.scrollIntoView({block:'center'}); }
+}
+async function submitReceive(id){
+  const no = fval(id,'order_no');
+  const part = fval(id,'part_code');
+  if(!no) return msg('还没有采购单，先新建一张',false);
+  if(!part) return msg('请填写到货零件编码',false);
+  const qty = numOr0(fval(id,'qty') || '1');
+  try{
+    await api('/api/purchase/receive',{method:'POST',body:{order_no:no, part_code:part, qty:qty,
+      qc_result:fval(id,'qc_result') || '合格'}});
+    msg('已到货入库：'+part+' × '+qty,true); pagePurchase();
+  }catch(e){ msg('到货失败：'+e.message,false); }
+}
+
+/* ---------- 生产 ---------- */
+async function pageProduction(){
+  try{
+    const list = await api('/api/production');
+    const cols = [
+      {k:'order_no',label:'生产单号'},{k:'product_code',label:'产品'},{k:'qty',label:'数量'},
+      {k:'status',label:'状态'},{k:'warehouse',label:'仓库'},{k:'created_at',label:'创建时间'}
+    ];
+    const actionCol = {label:'操作', html:true, get:function(r){
+      return '<button class="small" onclick="consumeMo(\''+r.order_no+'\')">领料</button> ' +
+             '<button class="small" onclick="completeMo(\''+r.order_no+'\')">完工</button>'; }};
+    const form = formRow('mo', [{k:'product_code',label:'产品编码',value:'FG-001'},{k:'qty',label:'数量',value:'10'},
+      {k:'planned_start',label:'计划开始',ph:'2026-10-20'},{k:'planned_end',label:'计划结束',ph:'2026-10-25'}], '新建生产单', 'submitMo');
+    $('view').innerHTML = '<div id="view-msg" class="msg"></div>' +
+      card('生产单（共 '+list.length+' 张）', table(list, cols.concat([actionCol]))) + card('新建生产单', form);
+  }catch(e){ $('view').innerHTML = '<div id="view-msg" class="msg err">生产单加载失败：'+esc(e.message)+'</div>'; }
+}
+async function submitMo(id){
+  try{
+    const d = await api('/api/production',{method:'POST',body:{product_code:fval(id,'product_code')||'FG-001',
+      qty:numOr0(fval(id,'qty')||'1'), planned_start:fval(id,'planned_start'), planned_end:fval(id,'planned_end')}});
+    msg('生产单已创建：'+d.order_no,true); pageProduction();
+  }catch(e){ msg('创建失败：'+e.message,false); }
+}
+async function consumeMo(no){
+  try{ const d = await api('/api/production/consume',{method:'POST',body:{order_no:no}});
+    msg('领料成功，共 '+((d.consumed||[]).length)+' 条',true); pageProduction(); }
+  catch(e){ msg('领料失败：'+e.message,false); }
+}
+async function completeMo(no){
+  try{ await api('/api/production/complete',{method:'POST',body:{order_no:no}}); msg('已完工入库',true); pageProduction(); }
+  catch(e){ msg('完工失败：'+e.message,false); }
+}
+
+/* ---------- 销售 ---------- */
+async function pageSales(){
+  try{
+    const list = await api('/api/sales');
+    const cols = [{k:'order_no',label:'销售单号'},{k:'customer',label:'客户'},{k:'product_code',label:'产品'},
+      {k:'qty',label:'数量'},{k:'due_date',label:'交期'},{k:'status',label:'状态'}];
+    const form = formRow('so', [{k:'order_no',label:'销售单号',ph:'留空自动生成'},{k:'customer',label:'客户',value:'示例客户'},
+      {k:'product_code',label:'产品',value:'FG-001'},{k:'qty',label:'数量',value:'100'},{k:'due_date',label:'交期',value:'2026-12-31'}], '新建销售单', 'submitSo');
+    $('view').innerHTML = '<div id="view-msg" class="msg"></div>' + card('销售单（共 '+list.length+' 张）', table(list, cols)) + card('新建销售单', form);
+  }catch(e){ $('view').innerHTML = '<div id="view-msg" class="msg err">销售单加载失败：'+esc(e.message)+'</div>'; }
+}
+async function submitSo(id){
+  // 后端销售单号必填：留空时前端按“SO-日期-随机数”生成，避免用户被 Pydantic 校验拦住
+  let no = fval(id,'order_no');
+  if(!no){
+    const d = new Date();
+    no = 'SO-' + d.toISOString().slice(0,10).replace(/-/g,'') + '-' + String(Math.floor(Math.random()*900+100));
+  }
+  try{
+    const d = await api('/api/sales',{method:'POST',body:{order_no:no,
+      customer:fval(id,'customer'), product_code:fval(id,'product_code')||'FG-001',
+      qty:numOr0(fval(id,'qty')||'1'), due_date:fval(id,'due_date')||undefined}});
+    msg('销售单已创建：'+d.order_no,true); pageSales();
+  }catch(e){ msg('创建失败：'+e.message,false); }
+}
+
+/* ---------- MRP ---------- */
+async function pageMrp(){
+  try{
+    const list = await api('/api/sales');
+    if(!list.length){
+      $('view').innerHTML = '<div id="view-msg" class="msg err">还没有销售单，请先到「销售」页新建一张，再回来跑 MRP</div>';
+      return;
+    }
+    const opts = list.map(function(s){ return '<option>'+esc(s.order_no)+'</option>'; }).join('');
+    $('view').innerHTML = '<div id="view-msg" class="msg"></div>' + card('MRP 运算',
+      '<div class="row"><label>销售单 <select id="mrp-so">'+opts+'</select></label>'+
+      '<button class="primary" onclick="runMrp()">运行 MRP</button>'+
+      '<button onclick="genMrp()">生成采购/生产单</button></div><div id="mrp-out"></div>');
+  }catch(e){ $('view').innerHTML = '<div id="view-msg" class="msg err">加载销售单失败：'+esc(e.message)+'</div>'; }
+}
+async function runMrp(){
+  const so = $('mrp-so') && $('mrp-so').value;
+  try{
+    const d = await api('/api/mrp',{method:'POST',body:{sales_order_no:so}});
+    const cols = [{k:'part_code',label:'零件'},{k:'part_name',label:'名称'},{k:'level',label:'层级'},
+      {k:'gross',label:'毛需求'},{k:'onhand',label:'现有'},{k:'in_transit',label:'在途'},{k:'available',label:'可用'},
+      {k:'safety',label:'安全库存'},{k:'net',label:'净需求'},{k:'need_type',label:'类型'},{k:'latest_order_date',label:'最晚下单日'},
+      {label:'调整',html:true,get:function(r){ return '<button class="small" onclick="adjustMrp(\''+so+'\',\''+r.part_code+'\')">改净需求</button>'; }}];
+    $('mrp-out').innerHTML = '<h3 style="margin:12px 0 6px">MRP 结果（'+d.results.length+' 条）</h3>' + table(d.results, cols);
+    msg('MRP 运行完成',true);
+  }catch(e){ msg('MRP 运行失败：'+e.message,false); }
+}
+async function adjustMrp(so, part){
+  const v = prompt('调整后净需求（'+part+'）：','0'); if(v===null) return;
+  try{ await api('/api/mrp/adjust',{method:'PUT',body:{sales_order_no:so, part_code:part, adjusted_net:numOr0(v)}}); msg('已调整',true); runMrp(); }
+  catch(e){ msg('调整失败：'+e.message,false); }
+}
+async function genMrp(){
+  const so = $('mrp-so') && $('mrp-so').value;
+  try{ const d = await api('/api/mrp/generate',{method:'POST',body:{sales_order_no:so}});
+    msg('已生成采购单：'+((d.purchase_orders||[]).join('、')||'无')+'；生产单：'+((d.production_orders||[]).join('、')||'无'),true); }
+  catch(e){ msg('生成失败：'+e.message,false); }
+}
+
+/* ---------- 补货 ---------- */
+async function pageReplenishment(){
+  try{
+    const rows = await api('/api/replenishment?days=30');
+    const cols = [{k:'part_code',label:'零件'},{k:'part_name',label:'名称'},{k:'available',label:'可用'},
+      {k:'daily_avg',label:'日均用量'},{k:'rop',label:'再订货点'},{k:'suggested_qty',label:'建议补货'},
+      {k:'recommended_supplier',label:'推荐供应商'}];
+    $('view').innerHTML = '<div id="view-msg" class="msg"></div>' + card('智能补货建议（'+rows.length+' 条）',
+      table(rows, cols) + '<div class="row" style="margin-top:10px"><button class="primary" onclick="genReplen()">一键生成采购单</button></div>');
+  }catch(e){ $('view').innerHTML = '<div id="view-msg" class="msg err">补货建议加载失败：'+esc(e.message)+'</div>'; }
+}
+async function genReplen(){
+  try{ const d = await api('/api/replenishment/generate-purchase-orders',{method:'POST',body:{days:30}});
+    msg('已生成采购单：'+((d.purchase_orders||[]).join('、')||'无'),true); pageReplenishment(); }
+  catch(e){ msg('生成失败：'+e.message,false); }
+}
+
+/* ---------- 报表 ---------- */
+const REPORTS = [['stock_balance','库存结存'],['purchase_summary','采购汇总'],['production_summary','生产汇总'],['payable','应付'],['audit_log','审计日志']];
+async function pageReports(){
+  $('view').innerHTML = '<div id="view-msg" class="msg"></div>' + card('报表',
+    '<div class="row">'+REPORTS.map(function(x){ return '<button onclick="loadReport(\''+x[0]+'\')">'+x[1]+'</button>'; }).join('')+
+    '<button onclick="downloadReport()">导出 Excel</button></div><div id="rp-out"></div>');
+  loadReport('stock_balance');
+}
+async function loadReport(kind){
+  S.report = kind;
+  try{
+    const d = await api('/api/reports/'+kind);
+    const cols = d.headers.map(function(h){ return {label:h, get:function(r){ return r[h]; }}; });
+    $('rp-out').innerHTML = '<h3 style="margin:12px 0 6px">'+esc(kind)+'（'+d.count+' 行）</h3>' + table(d.rows, cols);
+  }catch(e){ $('rp-out').innerHTML = '<div class="msg err">'+esc(e.message)+'</div>'; }
+}
+async function downloadReport(){
+  const kind = S.report || 'stock_balance';
+  try{
+    const r = await api('/api/reports/'+kind+'.xlsx');
+    const blob = await r.blob(); const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = 'report_'+kind+'.xlsx'; a.click();
+    URL.revokeObjectURL(a.href); msg('已下载 Excel',true);
+  }catch(e){ msg('下载失败：'+e.message,false); }
+}
+
+/* ---------- 审计日志 ---------- */
+async function pageAudit(){
+  try{
+    const rows = await api('/api/audit-log?limit=200');
+    const cols = [{k:'created_at',label:'时间'},{k:'username',label:'用户'},{k:'action',label:'动作'},
+      {k:'entity_type',label:'对象'},{k:'entity_id',label:'单号'},{k:'field_name',label:'字段'},
+      {k:'old_value',label:'原值'},{k:'new_value',label:'新值'}];
+    $('view').innerHTML = '<div id="view-msg" class="msg"></div>' + card('审计日志（'+rows.length+' 条，仅审计员/管理员可见）', table(rows, cols));
+  }catch(e){ $('view').innerHTML = '<div id="view-msg" class="msg err">'+esc(e.message)+'</div>'; }
+}
+
+/* ---------- 导入导出 ---------- */
+async function pageData(){
+  const kinds = [['parts','零件'],['stock','库存期初'],['purchase','采购单'],['bom','BOM'],['supplier','供应商'],['sales','销售单'],['production','生产单']];
+  let h = card('Excel 导入', '<div class="grid">'+kinds.map(function(x){
+    return '<label>'+x[1]+'<input type="file" id="imp-'+x[0]+'" accept=".xlsx"><button class="small" style="margin-top:4px" onclick="importExcel(\''+x[0]+'\')">导入'+x[1]+'</button></label>';
+  }).join('')+'</div><div id="imp-msg" class="msg"></div>');
+  h += card('Excel 模板下载', '<div class="row">'+kinds.map(function(x){ return '<button onclick="downloadTemplate(\''+x[0]+'\')">'+x[1]+'模板</button>'; }).join('')+'</div>');
+  h += card('Excel 全量导出', '<div class="row">'+kinds.map(function(x){ return '<button onclick="exportData(\''+x[0]+'\')">导出'+x[1]+'</button>'; }).join('')+'</div>');
+  $('view').innerHTML = '<div id="view-msg" class="msg"></div>' + h;
+}
+async function importExcel(kind){
+  const f = $('imp-'+kind).files[0];
+  if(!f) return setMsg('imp-msg','请先选择文件',false);
+  const fd = new FormData(); fd.append('file', f);
+  try{ const d = await api('/api/excel/import/'+kind,{method:'POST',form:fd});
+    setMsg('imp-msg','导入成功 '+d.imported+' 条'+(d.errors&&d.errors.length?('，错误：'+d.errors.slice(0,3).join('；')):''),true); }
+  catch(e){ setMsg('imp-msg','导入失败：'+e.message,false); }
+}
+async function downloadTemplate(kind){
+  try{ const r = await api('/api/excel/template/'+kind); const blob = await r.blob();
+    const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='template_'+kind+'.xlsx'; a.click(); URL.revokeObjectURL(a.href); }
+  catch(e){ alert('下载失败：'+e.message); }
+}
+async function exportData(kind){
+  try{ const r = await api('/api/excel/export/'+kind); const blob = await r.blob();
+    const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='export_'+kind+'.xlsx'; a.click(); URL.revokeObjectURL(a.href); }
+  catch(e){ alert('导出失败：'+e.message); }
+}
+
+/* ---------- 助手 ---------- */
+async function pageAssistant(){
+  $('view').innerHTML = '<div id="view-msg" class="msg"></div>' + card('助手查询（用大白话问库存/补货/采购单）',
+    '<div class="row"><input id="ask" style="flex:1;min-width:220px" placeholder="比如：查外壳还剩多少 / 哪些料需要补货">'+
+    '<button class="primary" onclick="ask()">问助手</button></div><div id="ask-out" class="msg"></div>');
 }
 async function ask(){
-  const text=document.getElementById('ask').value.trim();
-  if(!text){document.getElementById('askAns').textContent='请先输入问题';return;}
-  const r=await fetch('/api/assistant/query',{method:'POST',headers:headers(),body:JSON.stringify({text})});
-  const d=await r.json();
-  document.getElementById('askAns').textContent=(r.ok?d.answer:'查询失败：'+(d.detail||JSON.stringify(d)));
+  const text = $('ask').value.trim(); if(!text) return;
+  try{ const d = await api('/api/assistant/query',{method:'POST',body:{text:text}});
+    $('ask-out').className='msg'; $('ask-out').textContent = d.answer || JSON.stringify(d); }
+  catch(e){ $('ask-out').className='msg err'; $('ask-out').textContent='查询失败：'+e.message; }
 }
-async function loadDash(){
-  const r=await fetch('/api/dashboard',{headers:{'Authorization':'Bearer '+token()}});
-  if(!r.ok){document.getElementById('dash').textContent='看板加载失败（请先登录）：'+r.status;return;}
-  const d=await r.json();
-  let html='';
-  for(const k of ['replenishment','shortage','overdue_purchase','supplier_ranking','production_shortage']){
-    const b=d[k]; if(!b)continue;
-    html+='<div class="card"><b>'+b.title+'</b> <span class="'+b.status+'">'+b.status+'</span> 数量：'+b.count+'<br><small>'+JSON.stringify(b.items).slice(0,800)+'</small></div>';
+function showHelp(){ alert('默认账号：admin/admin（首次登录会要求改密码）。\n流程：开销售单 → 跑 MRP → 生成采购/生产单 → 到货入库 → 生产领料/完工。'); }
+
+/* ---------- 启动 ---------- */
+(function boot(){
+  // 页面刷新列表会整块重绘 #view，这里用 MutationObserver 把操作提示补回去
+  const v = $('view');
+  if(v && window.MutationObserver){
+    new MutationObserver(function(){ if(FLASH && $('view-msg')) setMsg('view-msg', FLASH.text, FLASH.ok); })
+      .observe(v, {childList:true});
   }
-  document.getElementById('dash').innerHTML=html;
-}
-async function show(url){
-  const r=await fetch(url,{headers:{'Authorization':'Bearer '+token()}});
-  document.getElementById('out').textContent=url+'\n'+JSON.stringify(await r.json(),null,2).slice(0,6000);
-}
-async function genRepl(){
-  if(!confirm('按当前补货建议生成采购单？'))return;
-  const r=await fetch('/api/replenishment/generate-purchase-orders',{method:'POST',headers:headers(),body:JSON.stringify({})});
-  document.getElementById('out').textContent=JSON.stringify(await r.json(),null,2);
-  loadDash();
-}
-async function doImport(){
-  const f=document.getElementById('impFile').files[0];
-  if(!f){alert('请先选一个 .xlsx 文件');return;}
-  const kind=document.getElementById('impKind').value;
-  const sheet=document.getElementById('impSheet').value.trim();
-  const fd=new FormData(); fd.append('file',f);
-  let url='/api/excel/import/'+kind; if(sheet)url+='?sheet='+encodeURIComponent(sheet);
-  const r=await fetch(url,{method:'POST',headers:{'Authorization':'Bearer '+token()},body:fd});
-  document.getElementById('out').textContent=JSON.stringify(await r.json(),null,2);
-}
-// 已登录时直接进主页
-if(token()){document.getElementById('app').classList.remove('hidden');fetch('/api/auth/me',{headers:headers()}).then(r=>r.json()).then(d=>{document.getElementById('me').textContent=d.username+'（'+(d.roles||[]).join('、')+'）';if(d.must_change_password)document.getElementById('mustChange').classList.remove('hidden');});loadDash();}
-</script></body></html>
+  if(S.token){
+    api('/api/auth/me').then(function(me){ S.user = me.username || me.user; enterApp(); }).catch(function(){ logout(true); });
+  } else {
+    $('login').classList.remove('hidden');
+  }
+})();
+</script>
+</body>
+</html>

@@ -27,13 +27,16 @@ import os
 import sqlite3
 import io
 import hashlib
+import logging
 import math
 import secrets
+import contextvars
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Header
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -66,43 +69,146 @@ def verify_password(password: str, stored: str) -> bool:
 def token_hash(token: str) -> str:
     return hashlib.sha256(str(token).encode("utf-8")).hexdigest()
 
+logger = logging.getLogger("pmc_phase3")
+if not logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(_h)
+    logger.setLevel(logging.INFO)
+
+# 大白话：每个请求登记自己开过的数据库连接，请求结束时统一兜底关闭。
+# 这样即使某个接口半路抛异常、忘了 close，未提交的写事务也会被回滚，不会再出现
+# “一个坏请求把 SQLite 写锁卡死到重启”的问题（P0-2 的根治措施之一）。
+_REQ_CONNS: "contextvars.ContextVar[Optional[list]]" = contextvars.ContextVar("pmc_req_conns", default=None)
+
+
+def close_quietly(conn) -> None:
+    """关连接：先回滚未提交事务再关闭，任何异常都吞掉（兜底清理用）。"""
+    if conn is None:
+        return
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
 @app.middleware("http")
 async def auth_middleware(request, call_next):
     """登录态校验中间件（大白话：门口保安）。
     /api/ 开头的接口必须带有效的 Bearer Token，否则 401；登录接口 /health /前端页面/预检请求放行。
     校验通过后，把 Token 对应的用户名写进 X-User 请求头，后面所有老接口不用改就能认出当前用户。
-    注意：X-User 直传已不再被信任（第二阶段的演示身份已废弃），必须走登录拿 Token。"""
+    注意：X-User 直传已不再被信任（第二阶段的演示身份已废弃），必须走登录拿 Token。
+    另外：本请求内开过、但接口忘记关闭的数据库连接，在这里统一 rollback + close（P0-2 兜底）。"""
     path = request.url.path
-    if request.method == "OPTIONS" or path in ("/", "/health", "/api/auth/login", "/openapi.json", "/docs", "/redoc") \
-            or path.startswith("/docs") or not path.startswith("/api/"):
+    req_conns: list = []
+    _token = _REQ_CONNS.set(req_conns)
+    try:
+        if request.method == "OPTIONS" or path in ("/", "/health", "/api/auth/login", "/openapi.json", "/docs", "/redoc") \
+                or path.startswith("/docs") or not path.startswith("/api/"):
+            return await call_next(request)
+        auth = request.headers.get("authorization", "")
+        token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+        username = ""
+        if token:
+            try:
+                conn = get_conn()
+                row = conn.execute("SELECT username FROM auth_tokens WHERE token_hash=? AND expires_at>?",
+                                   (token_hash(token), now_str())).fetchone()
+                conn.close()
+                if row:
+                    username = row["username"]
+            except Exception:
+                username = ""
+        if not username:
+            return JSONResponse(status_code=401, content={"detail": "未登录或登录已过期，请先 POST /api/auth/login 登录（默认 admin / admin，首次登录请改密码）"})
+        # 把用户名注入 X-User 头（Starlette 的 scope headers 是可改的列表）
+        headers = [(k, v) for k, v in request.scope.get("headers", []) if k.lower() != b"x-user"]
+        headers.append((b"x-user", username.encode("utf-8")))
+        request.scope["headers"] = headers
         return await call_next(request)
-    auth = request.headers.get("authorization", "")
-    token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
-    username = ""
-    if token:
-        try:
-            conn = get_conn()
-            row = conn.execute("SELECT username FROM auth_tokens WHERE token_hash=? AND expires_at>?",
-                               (token_hash(token), now_str())).fetchone()
-            conn.close()
-            if row:
-                username = row["username"]
-        except Exception:
-            username = ""
-    if not username:
-        from fastapi.responses import JSONResponse
-        return JSONResponse(status_code=401, content={"detail": "未登录或登录已过期，请先 POST /api/auth/login 登录（默认 admin / admin，首次登录请改密码）"})
-    # 把用户名注入 X-User 头（Starlette 的 scope headers 是可改的列表）
-    headers = [(k, v) for k, v in request.scope.get("headers", []) if k.lower() != b"x-user"]
-    headers.append((b"x-user", username.encode("utf-8")))
-    request.scope["headers"] = headers
-    return await call_next(request)
+    finally:
+        for _c in req_conns:
+            close_quietly(_c)
+        _REQ_CONNS.reset(_token)
+
 
 # ---------- 数据库 ----------
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
+    """拿一个数据库连接（大白话：打开数据库大门）。
+    timeout=5 + busy_timeout：别人正在写时最多等 5 秒，而不是立刻报 database is locked；
+    check_same_thread=False：允许请求结束后的兜底清理线程关闭连接（每个请求各用各的连接）。"""
+    conn = sqlite3.connect(DB_PATH, timeout=5.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA busy_timeout=5000")
+    except Exception:
+        pass
+    reg = _REQ_CONNS.get()
+    if reg is not None:
+        reg.append(conn)
     return conn
+
+
+@contextmanager
+def db_tx():
+    """写操作统一事务：正常结束 commit；抛异常 rollback；无论如何都 close。
+    大白话：要么全成、要么全不成，绝不把“写了一半的锁”留给下一个请求。"""
+    conn = get_conn()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def num_field(value, field: str = "数量", *, required: bool = False, default: float = 0.0,
+              positive: bool = False) -> float:
+    """把请求里的数量/金额安全转成数字（大白话：填错就好好说“这不是数字”，而不是崩成 500）。
+    非法输入返回 422（和 FastAPI 的字段校验同类），不再让 float() 直接抛 ValueError。"""
+    if value is None or (isinstance(value, str) and value.strip() == ""):
+        if required:
+            raise HTTPException(422, f"{field}不能为空")
+        v = float(default)
+    else:
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            raise HTTPException(422, f"{field}必须是数字，收到：{value!r}")
+        if not math.isfinite(v):
+            raise HTTPException(422, f"{field}必须是有效数字，收到：{value!r}")
+    if positive and v <= 0:
+        raise HTTPException(422, f"{field}必须大于 0，收到：{v}")
+    return v
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request, exc):
+    """兜底异常处理（大白话：真出意外了，给一句人话 + 记日志，别只吐一坨 500）。"""
+    logger.exception("未处理异常 %s %s: %s", request.method, request.url.path, exc)
+    return JSONResponse(status_code=500, content={"detail": f"服务器内部错误：{type(exc).__name__}（详细日志见服务端控制台）"})
+
+
+@app.exception_handler(sqlite3.OperationalError)
+async def sqlite_operational_error_handler(request, exc):
+    """数据库忙/被锁时返回 503 并提示重试，而不是裸 500。"""
+    msg = str(exc)
+    logger.error("数据库操作失败 %s %s: %s", request.method, request.url.path, msg)
+    if "locked" in msg.lower() or "busy" in msg.lower():
+        return JSONResponse(status_code=503, content={"detail": "数据库正忙（有别的写操作没释放锁），请稍后重试"})
+    return JSONResponse(status_code=500, content={"detail": f"数据库操作失败：{msg}"})
 
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -199,20 +305,46 @@ def warehouse_company(conn, warehouse):
         return "COMP-001"
 
 def next_doc_no(conn, series):
-    """数据库序列单号（大白话：单号从数据库的一张计数表里取，取完计数+1，同一事务里锁住，不会重复）。
-    思路来源：ERPNext 命名序列（Naming Series）：每个前缀一个计数器，见 https://docs.frappe.io/erpnext/document-naming-for-avoiding-tab-series-issues
+    """数据库序列单号（大白话：单号从一张计数表里取，取完计数+1）。
+    并发安全做法：先用 BEGIN IMMEDIATE 抢写锁再读号，避免两个请求同时读到同一个号；
+    抢不到锁（database is locked）时自动重试 3 次，不再让用户看到“单号已存在”。
     格式：PO-2026-0001 / MO-2026-0001 / PR-2026-0001 / PAY-2026-0001。"""
+    import time as _time
     year = date.today().year
     key = f"{series}-{year}"
     prefix = f"{series}-{year}-"
-    row = conn.execute("SELECT next_no FROM doc_sequences WHERE series_key=?", (key,)).fetchone()
-    if row:
-        n = int(row["next_no"])
-        conn.execute("UPDATE doc_sequences SET next_no=? WHERE series_key=?", (n + 1, key))
-    else:
-        n = 1
-        conn.execute("INSERT INTO doc_sequences (series_key,prefix,next_no) VALUES (?,?,?)", (key, prefix, 2))
-    return f"{prefix}{n:04d}"
+    for attempt in range(3):
+        own_tx = False
+        try:
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
+                own_tx = True
+            row = conn.execute("SELECT next_no FROM doc_sequences WHERE series_key=?", (key,)).fetchone()
+            if row is None:
+                n = 1
+                try:
+                    conn.execute("INSERT INTO doc_sequences (series_key,prefix,next_no) VALUES (?,?,?)", (key, prefix, 2))
+                except sqlite3.IntegrityError:
+                    row = conn.execute("SELECT next_no FROM doc_sequences WHERE series_key=?", (key,)).fetchone()
+                    n = int(row["next_no"])
+                    conn.execute("UPDATE doc_sequences SET next_no=? WHERE series_key=?", (n + 1, key))
+            else:
+                n = int(row["next_no"])
+                conn.execute("UPDATE doc_sequences SET next_no=? WHERE series_key=?", (n + 1, key))
+            if own_tx:
+                conn.commit()
+            return f"{prefix}{n:04d}"
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            if attempt == 2:
+                raise HTTPException(503, "单号生成繁忙（数据库锁等待超时），请稍后重试")
+            _time.sleep(0.05)
+
 
 def get_exchange_rate(conn, from_cur, to_cur, on_date=None):
     """查汇率：同币种=1；有直接汇率用直接的；只有反向汇率用倒数；都没有返回 None（调用方决定报错还是默认）。"""
@@ -840,6 +972,16 @@ def get_available(part_code: str, warehouse: Optional[str] = None, company_code:
     """可用量 = 现有 + 在途 - 已分配 - 冻结（核心公式，第一阶段新增，第二阶段按仓库/公司/批次过滤），可按仓库/公司过滤"""
     return get_onhand(part_code, warehouse, company_code) + get_in_transit(part_code, warehouse, company_code) - get_allocated(part_code, warehouse, company_code) - get_frozen(part_code, warehouse, None, company_code)
 
+def available_in_scope(part_code: str, user: str) -> float:
+    """按登录用户的仓库/公司权限算可用量（P0-4：看板不再把别的公司库存算进来）。
+    管理员/未配置范围 = 全量；配置了范围就按范围内的仓库×公司逐个求和。"""
+    ac = allowed_companies(user); aw = allowed_warehouses(user)
+    if not ac and not aw:
+        return get_available(part_code)
+    comps = list(ac) if ac else [None]
+    whs = list(aw) if aw else [None]
+    return sum(get_available(part_code, w, c) for c in comps for w in whs)
+
 def stock_status(available: float, safety: float, max_stock: float) -> str:
     """红黄绿：可用量<=0 红（断货），<安全库存 黄（预警），>最高库存 黄（积压），其余 绿"""
     if available <= 0:
@@ -850,42 +992,87 @@ def stock_status(available: float, safety: float, max_stock: float) -> str:
         return "黄"
     return "绿"
 
-def add_ledger(part_code, qty_change, typ, ref_no, remark="", warehouse="主仓", batch="BATCH-20261019", company_code=None):
-    conn = get_conn()
-    if company_code is None:
-        company_code = warehouse_company(conn, warehouse)
-    conn.execute("INSERT INTO stock_ledger (part_code,warehouse,batch,change_qty,type,ref_no,remark,created_at,company_code) VALUES (?,?,?,?,?,?,?,?,?)",
-                 (part_code, warehouse, batch, qty_change, typ, ref_no, remark, now_str(), company_code))
-    conn.commit()
-    conn.close()
+# 默认库位/批次（大白话：以前写死 A区-01 / BATCH-20261019，现在可以用环境变量覆盖；
+# 入库/到货/领料也允许显式传批次，见各接口。彻底改成“仓库主数据”留到下一阶段，见修复报告未修项）
+DEFAULT_LOCATION = os.environ.get("PMC_DEFAULT_LOCATION", "A区-01")
+DEFAULT_BATCH = os.environ.get("PMC_DEFAULT_BATCH", "BATCH-20261019")
 
-def adjust_stock(part_code, delta, typ, ref_no, warehouse="主仓", location="A区-01", batch="BATCH-20261019", company_code=None):
-    """调库存（大白话：入库就加，出库就减），同时记流水"""
-    conn = get_conn()
-    if company_code is None:
-        company_code = warehouse_company(conn, warehouse)
-    row = conn.execute("SELECT * FROM stock WHERE part_code=? AND warehouse=? AND location=? AND batch=?", (part_code, warehouse, location, batch)).fetchone()
-    if row:
-        conn.execute("UPDATE stock SET qty=qty+? WHERE id=?", (delta, row["id"]))
-    else:
-        conn.execute("INSERT INTO stock (part_code,warehouse,location,batch,qty,company_code) VALUES (?,?,?,?,?,?)", (part_code, warehouse, location, batch, delta, company_code))
-    conn.commit()
-    conn.close()
-    add_ledger(part_code, delta, typ, ref_no, f"{typ} {delta}", warehouse, batch, company_code)
+def add_ledger(part_code, qty_change, typ, ref_no, remark="", warehouse="主仓", batch=None, company_code=None, conn=None):
+    """记库存流水（大白话：库存每动一次就写一条账）。传了 conn 就复用同一个事务，不再自己提交。"""
+    own = conn is None
+    if own:
+        conn = get_conn()
+    try:
+        if company_code is None:
+            company_code = warehouse_company(conn, warehouse)
+        conn.execute("INSERT INTO stock_ledger (part_code,warehouse,batch,change_qty,type,ref_no,remark,created_at,company_code) VALUES (?,?,?,?,?,?,?,?,?)",
+                     (part_code, warehouse, batch or DEFAULT_BATCH, qty_change, typ, ref_no, remark, now_str(), company_code))
+        if own:
+            conn.commit()
+    except Exception:
+        if own:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        raise
+    finally:
+        if own:
+            conn.close()
+
+def adjust_stock(part_code, delta, typ, ref_no, warehouse="主仓", location=None, batch=None, company_code=None, conn=None):
+    """调库存（大白话：入库就加，出库就减），库存变更和流水写在同一个事务里（P1-6：不再“库存变了却没流水”）"""
+    own = conn is None
+    if own:
+        conn = get_conn()
+    location = location or DEFAULT_LOCATION
+    batch = batch or DEFAULT_BATCH
+    try:
+        if company_code is None:
+            company_code = warehouse_company(conn, warehouse)
+        row = conn.execute("SELECT * FROM stock WHERE part_code=? AND warehouse=? AND location=? AND batch=?", (part_code, warehouse, location, batch)).fetchone()
+        if row:
+            conn.execute("UPDATE stock SET qty=qty+? WHERE id=?", (delta, row["id"]))
+        else:
+            conn.execute("INSERT INTO stock (part_code,warehouse,location,batch,qty,company_code) VALUES (?,?,?,?,?,?)", (part_code, warehouse, location, batch, delta, company_code))
+        conn.execute("INSERT INTO stock_ledger (part_code,warehouse,batch,change_qty,type,ref_no,remark,created_at,company_code) VALUES (?,?,?,?,?,?,?,?,?)",
+                     (part_code, warehouse, batch, delta, typ, ref_no, f"{typ} {delta}", now_str(), company_code))
+        if own:
+            conn.commit()
+    except Exception:
+        if own:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        raise
+    finally:
+        if own:
+            conn.close()
+
+def _version_key(v: str):
+    """版本号排序键（大白话：V10 要排在 V9 后面，不能按字符串比大小）。
+    取版本号里的数字；解析不出数字的排最后，再按原字符串兜底。"""
+    import re as _re
+    m = _re.search(r"(\d+)", str(v or ""))
+    return (0, int(m.group(1)), str(v)) if m else (1, 0, str(v))
 
 def resolve_bom_version(conn, parent_code: str, version: Optional[str] = None) -> str:
-    """解析 BOM 版本：指定了就用指定的；没指定就用“生效日期 <= 今天”的最新版本；都没有就用最新版本"""
+    """解析 BOM 版本：指定了就用指定的；没指定就用“生效日期 <= 今天”的最新版本（数字比较，V10 > V9）；
+    一个生效版本都没有时才退回最新版本（P1-7）。"""
     if version:
         row = conn.execute("SELECT version FROM bom_items WHERE parent_code=? AND version=? LIMIT 1", (parent_code, version)).fetchone()
         if row:
             return version
         raise HTTPException(404, f"父件 {parent_code} 没有 BOM 版本 {version}")
-    row = conn.execute("SELECT version FROM bom_items WHERE parent_code=? AND (effective_date='' OR effective_date<=?) ORDER BY effective_date DESC, version DESC LIMIT 1",
-                       (parent_code, TODAY)).fetchone()
-    if row:
-        return row["version"]
-    row = conn.execute("SELECT version FROM bom_items WHERE parent_code=? ORDER BY version DESC LIMIT 1", (parent_code,)).fetchone()
-    return row["version"] if row else "V1"
+    rows = conn.execute("SELECT DISTINCT version FROM bom_items WHERE parent_code=? AND (effective_date IS NULL OR effective_date='' OR effective_date<=?)",
+                        (parent_code, TODAY)).fetchall()
+    if rows:
+        return max((r["version"] for r in rows), key=_version_key)
+    rows = conn.execute("SELECT DISTINCT version FROM bom_items WHERE parent_code=?", (parent_code,)).fetchall()
+    if rows:
+        return max((r["version"] for r in rows), key=_version_key)
+    return "V1"
 
 def bom_explode(conn, parent: str, qty: float, version: Optional[str] = None):
     """
@@ -1145,7 +1332,9 @@ def delete_supplier(code: str, x_user: Optional[str] = Header(None)):
     return {"ok": True, "code": code}
 
 @app.post("/api/suppliers/{code}/blacklist")
-def blacklist_supplier(code: str):
+def blacklist_supplier(code: str, x_user: Optional[str] = Header(None)):
+    user = resolve_user(x_user)
+    require_perm(user, "供应商", "edit")
     """拉黑供应商（大白话：这个供应商不能再用了，比价时会自动跳过）"""
     conn = get_conn()
     r = conn.execute("SELECT id FROM suppliers WHERE code=?", (code,)).fetchone()
@@ -1157,7 +1346,9 @@ def blacklist_supplier(code: str):
     return {"ok": True, "code": code, "status": "黑名单"}
 
 @app.post("/api/suppliers/{code}/approve")
-def approve_supplier(code: str):
+def approve_supplier(code: str, x_user: Optional[str] = Header(None)):
+    user = resolve_user(x_user)
+    require_perm(user, "供应商", "approve")
     """恢复为合格供应商"""
     conn = get_conn()
     r = conn.execute("SELECT id FROM suppliers WHERE code=?", (code,)).fetchone()
@@ -1368,7 +1559,9 @@ def compare_bom(payload: Dict[str, Any]):
     return {"parent_code": parent, "version_a": v1, "version_b": v2, "added": added, "removed": removed, "changed": changed}
 
 @app.post("/api/bom/explode")
-def bom_explode_api(payload: Dict[str, Any]):
+def bom_explode_api(payload: Dict[str, Any], x_user: Optional[str] = Header(None)):
+    user = resolve_user(x_user)
+    require_perm(user, "零件", "view")
     """BOM 爆炸（多层，带层级 + 循环检测）。传 leaf_only=true 只返回叶子零件。"""
     parent = payload.get("parent_code", "FG-001")
     qty = float(payload.get("qty", 1))
@@ -1445,7 +1638,9 @@ def batch_available(part_code: str, warehouse: str = "主仓", batch: str = "", 
             "onhand": onhand, "frozen": frozen, "available": avail}
 
 @app.get("/api/stock/ledger")
-def list_ledger(part_code: Optional[str] = None):
+def list_ledger(part_code: Optional[str] = None, x_user: Optional[str] = Header(None)):
+    user = resolve_user(x_user)
+    require_perm(user, "库存", "view")
     conn = get_conn()
     if part_code:
         rows = conn.execute("SELECT * FROM stock_ledger WHERE part_code=? ORDER BY id DESC LIMIT 200", (part_code,)).fetchall()
@@ -1455,7 +1650,9 @@ def list_ledger(part_code: Optional[str] = None):
     return [row_to_dict(r) for r in rows]
 
 @app.get("/api/stock/trace/{part_code}")
-def trace_stock(part_code: str):
+def trace_stock(part_code: str, x_user: Optional[str] = Header(None)):
+    user = resolve_user(x_user)
+    require_perm(user, "库存", "view")
     """批次追溯（大白话：一个零件从哪来、到哪去：期初/采购入库/领料/盘点/调拨，全部流水）"""
     conn = get_conn()
     part = conn.execute("SELECT * FROM parts WHERE code=?", (part_code,)).fetchone()
@@ -1483,6 +1680,9 @@ def list_available(warehouse: Optional[str] = None, company_code: Optional[str] 
     conn = get_conn()
     parts = conn.execute("SELECT * FROM parts ORDER BY code").fetchall()
     conn.close()
+    ac_list = allowed_companies(user)
+    if ac_list:
+        parts = [p for p in parts if (p["company_code"] if "company_code" in p.keys() else "COMP-001") in ac_list]
     out = []
     for p in parts:
         code = p["code"]
@@ -1496,12 +1696,17 @@ def list_available(warehouse: Optional[str] = None, company_code: Optional[str] 
     return out
 
 @app.get("/api/stock/available/{part_code}")
-def one_available(part_code: str, warehouse: Optional[str] = None, company_code: Optional[str] = None):
+def one_available(part_code: str, warehouse: Optional[str] = None, company_code: Optional[str] = None, x_user: Optional[str] = Header(None)):
+    """单个零件可用量（P0-4：补权限 + 仓库/公司范围校验；以前谁登录都能看别的公司/仓库）"""
+    user = resolve_user(x_user)
+    require_perm(user, "库存", "view")
     conn = get_conn()
     p = conn.execute("SELECT * FROM parts WHERE code=?", (part_code,)).fetchone()
     conn.close()
     if not p:
         raise HTTPException(404, f"零件 {part_code} 不存在")
+    # P0-4：按零件所属公司校验范围（以前只校验 query 参数，keeper 直接传零件号就能看别家公司）
+    check_scope(user, warehouse=warehouse, company_code=company_code or (p["company_code"] if "company_code" in p.keys() else None))
     onhand = get_onhand(part_code, warehouse, company_code); it = get_in_transit(part_code, warehouse, company_code)
     al = get_allocated(part_code, warehouse, company_code); fr = get_frozen(part_code, warehouse, None, company_code)
     avail = onhand + it - al - fr
@@ -1515,13 +1720,13 @@ def stock_in(payload: Dict[str, Any], x_user: Optional[str] = Header(None)):
     """入库（大白话：货进仓库，库存增加）。type 如：采购入库/其他入库/生产入库"""
     user = resolve_user(x_user)
     require_perm(user, "库存", "create")
-    code = payload.get("part_code", ""); qty = float(payload.get("qty", 0) or 0)
+    code = payload.get("part_code", ""); qty = num_field(payload.get("qty"), "数量", required=True, positive=True)
     warehouse = payload.get("warehouse", "主仓")
     check_scope(user, warehouse=warehouse)
-    if not code or qty <= 0:
-        raise HTTPException(400, "零件编码必填，数量必须 > 0")
+    if not code:
+        raise HTTPException(400, "零件编码必填")
     adjust_stock(code, qty, payload.get("type", "其他入库"), payload.get("ref_no", "手动入库"),
-                 warehouse, payload.get("location", "A区-01"), payload.get("batch", "BATCH-20261019"))
+                 warehouse, payload.get("location") or DEFAULT_LOCATION, payload.get("batch") or DEFAULT_BATCH)
     log_audit(user, "入库", "库存", code, "数量", "", f"+{qty}@{warehouse}", payload.get("ref_no", "手动入库"))
     return {"ok": True, "part_code": code, "qty": qty, "onhand": get_onhand(code, warehouse)}
 
@@ -1530,18 +1735,24 @@ def stock_out(payload: Dict[str, Any], x_user: Optional[str] = Header(None)):
     """出库（大白话：货出仓库，库存减少）。出库前检查该批次可用库存（现有-该批次冻结）够不够。"""
     user = resolve_user(x_user)
     require_perm(user, "库存", "edit")
-    code = payload.get("part_code", ""); qty = float(payload.get("qty", 0) or 0)
-    warehouse = payload.get("warehouse", "主仓"); batch = payload.get("batch", "BATCH-20261019")
+    code = payload.get("part_code", ""); qty = num_field(payload.get("qty"), "数量", required=True, positive=True)
+    warehouse = payload.get("warehouse", "主仓"); batch = payload.get("batch") or DEFAULT_BATCH
     check_scope(user, warehouse=warehouse)
-    if not code or qty <= 0:
-        raise HTTPException(400, "零件编码必填，数量必须 > 0")
+    if not code:
+        raise HTTPException(400, "零件编码必填")
     conn = get_conn()
-    batch_avail = get_batch_available(conn, code, warehouse, batch)
-    conn.close()
-    if batch_avail + 1e-9 < qty:
-        raise HTTPException(400, f"零件 {code} 批次 {batch} 可用量不足：需要 {qty}，该批次可用 {batch_avail}（现有-该批次冻结）")
-    adjust_stock(code, -qty, payload.get("type", "其他出库"), payload.get("ref_no", "手动出库"),
-                 warehouse, payload.get("location", "A区-01"), batch)
+    try:
+        batch_avail = get_batch_available(conn, code, warehouse, batch)
+        if batch_avail + 1e-9 < qty:
+            raise HTTPException(400, f"零件 {code} 批次 {batch} 可用量不足：需要 {qty}，该批次可用 {batch_avail}（现有-该批次冻结）")
+        adjust_stock(code, -qty, payload.get("type", "其他出库"), payload.get("ref_no", "手动出库"),
+                     warehouse, payload.get("location") or DEFAULT_LOCATION, batch, conn=conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
     log_audit(user, "出库", "库存", code, "数量", "", f"-{qty}@{warehouse}/{batch}", payload.get("ref_no", "手动出库"))
     return {"ok": True, "part_code": code, "qty": qty, "onhand": get_onhand(code, warehouse)}
 
@@ -1551,38 +1762,42 @@ def stock_transfer(payload: Dict[str, Any], x_user: Optional[str] = Header(None)
     兼容第一阶段：只传 warehouse 时当同仓库调拨；传 from_warehouse/to_warehouse 时当跨仓库调拨。"""
     user = resolve_user(x_user)
     require_perm(user, "库存", "edit")
-    code = payload.get("part_code", ""); qty = float(payload.get("qty", 0) or 0)
-    from_loc = payload.get("from_location", "A区-01"); to_loc = payload.get("to_location", "B区-01")
-    from_batch = payload.get("from_batch", "BATCH-20261019"); to_batch = payload.get("to_batch", from_batch)
+    code = payload.get("part_code", ""); qty = num_field(payload.get("qty"), "数量", required=True, positive=True)
+    from_loc = payload.get("from_location") or DEFAULT_LOCATION; to_loc = payload.get("to_location", "B区-01")
+    from_batch = payload.get("from_batch") or DEFAULT_BATCH; to_batch = payload.get("to_batch", from_batch)
     from_wh = payload.get("from_warehouse") or payload.get("warehouse", "主仓")
     to_wh = payload.get("to_warehouse") or payload.get("warehouse", "主仓")
     check_scope(user, warehouse=from_wh); check_scope(user, warehouse=to_wh)
-    if not code or qty <= 0:
-        raise HTTPException(400, "零件编码必填，数量必须 > 0")
+    if not code:
+        raise HTTPException(400, "零件编码必填")
     if from_wh == to_wh and from_loc == to_loc and from_batch == to_batch:
         raise HTTPException(400, "调出与调入库位/批次相同，不用调拨")
     conn = get_conn()
-    if warehouse_company(conn, from_wh) != warehouse_company(conn, to_wh):
+    try:
+        fc = warehouse_company(conn, from_wh); tc = warehouse_company(conn, to_wh)
+        if fc != tc:
+            raise HTTPException(400, f"不能跨公司调拨：{from_wh}（{fc}）→ {to_wh}（{tc}），公司隔离")
+        row = conn.execute("SELECT * FROM stock WHERE part_code=? AND warehouse=? AND location=? AND batch=?", (code, from_wh, from_loc, from_batch)).fetchone()
+        if not row:
+            raise HTTPException(400, f"调出库位无库存：{from_wh}/{from_loc}/{from_batch}")
+        batch_avail = float(row["qty"]) - get_batch_frozen(conn, code, from_wh, from_batch)
+        if batch_avail + 1e-9 < qty:
+            raise HTTPException(400, f"调出批次可用量不足：{from_wh}/{from_batch} 可用 {batch_avail}（现有 {float(row['qty'])} - 该批次冻结），要调 {qty}")
+        conn.execute("UPDATE stock SET qty=qty-? WHERE id=?", (qty, row["id"]))
+        dest = conn.execute("SELECT * FROM stock WHERE part_code=? AND warehouse=? AND location=? AND batch=?", (code, to_wh, to_loc, to_batch)).fetchone()
+        if dest:
+            conn.execute("UPDATE stock SET qty=qty+? WHERE id=?", (qty, dest["id"]))
+        else:
+            conn.execute("INSERT INTO stock (part_code,warehouse,location,batch,qty,company_code) VALUES (?,?,?,?,?,?)", (code, to_wh, to_loc, to_batch, qty, tc))
+        note = f"从 {from_wh}/{from_loc}/{from_batch} 调到 {to_wh}/{to_loc}/{to_batch}"
+        add_ledger(code, -qty, "调拨出", payload.get("ref_no", "调拨"), note, from_wh, from_batch, conn=conn)
+        add_ledger(code, qty, "调拨入", payload.get("ref_no", "调拨"), note, to_wh, to_batch, conn=conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
         conn.close()
-        raise HTTPException(400, f"不能跨公司调拨：{from_wh}（{warehouse_company(get_conn(), from_wh)}）→ {to_wh}（{warehouse_company(get_conn(), to_wh)}），公司隔离")
-    row = conn.execute("SELECT * FROM stock WHERE part_code=? AND warehouse=? AND location=? AND batch=?", (code, from_wh, from_loc, from_batch)).fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(400, f"调出库位无库存：{from_wh}/{from_loc}/{from_batch}")
-    batch_avail = float(row["qty"]) - get_batch_frozen(conn, code, from_wh, from_batch)
-    if batch_avail + 1e-9 < qty:
-        conn.close()
-        raise HTTPException(400, f"调出批次可用量不足：{from_wh}/{from_batch} 可用 {batch_avail}（现有 {float(row['qty'])} - 该批次冻结），要调 {qty}")
-    conn.execute("UPDATE stock SET qty=qty-? WHERE id=?", (qty, row["id"]))
-    dest = conn.execute("SELECT * FROM stock WHERE part_code=? AND warehouse=? AND location=? AND batch=?", (code, to_wh, to_loc, to_batch)).fetchone()
-    to_company = warehouse_company(conn, to_wh)
-    if dest:
-        conn.execute("UPDATE stock SET qty=qty+? WHERE id=?", (qty, dest["id"]))
-    else:
-        conn.execute("INSERT INTO stock (part_code,warehouse,location,batch,qty,company_code) VALUES (?,?,?,?,?,?)", (code, to_wh, to_loc, to_batch, qty, to_company))
-    conn.commit(); conn.close()
-    add_ledger(code, -qty, "调拨出", payload.get("ref_no", "调拨"), f"从 {from_wh}/{from_loc}/{from_batch} 调到 {to_wh}/{to_loc}/{to_batch}", from_wh, from_batch)
-    add_ledger(code, qty, "调拨入", payload.get("ref_no", "调拨"), f"从 {from_wh}/{from_loc}/{from_batch} 调到 {to_wh}/{to_loc}/{to_batch}", to_wh, to_batch)
     log_audit(user, "调拨", "库存", code, "数量", "", f"{qty} {from_wh}→{to_wh}", payload.get("ref_no", "调拨"))
     return {"ok": True, "part_code": code, "qty": qty, "from": f"{from_wh}/{from_loc}/{from_batch}", "to": f"{to_wh}/{to_loc}/{to_batch}"}
 
@@ -1592,24 +1807,31 @@ def stock_count(payload: Dict[str, Any], x_user: Optional[str] = Header(None)):
     user = resolve_user(x_user)
     require_perm(user, "库存", "edit")
     code = payload.get("part_code", "")
-    counted = float(payload.get("counted_qty", 0) or 0)
-    warehouse = payload.get("warehouse", "主仓"); location = payload.get("location", "A区-01")
-    batch = payload.get("batch", "BATCH-20261019")
+    counted = num_field(payload.get("counted_qty"), "实盘数量", required=True)
+    warehouse = payload.get("warehouse", "主仓"); location = payload.get("location") or DEFAULT_LOCATION
+    batch = payload.get("batch") or DEFAULT_BATCH
     check_scope(user, warehouse=warehouse)
     if not code:
         raise HTTPException(400, "零件编码必填")
     conn = get_conn()
-    row = conn.execute("SELECT * FROM stock WHERE part_code=? AND warehouse=? AND location=? AND batch=?", (code, warehouse, location, batch)).fetchone()
-    old = float(row["qty"]) if row else 0
-    diff = counted - old
-    comp = warehouse_company(conn, warehouse)
-    if row:
-        conn.execute("UPDATE stock SET qty=? WHERE id=?", (counted, row["id"]))
-    else:
-        conn.execute("INSERT INTO stock (part_code,warehouse,location,batch,qty,company_code) VALUES (?,?,?,?,?,?)", (code, warehouse, location, batch, counted, comp))
-    conn.commit(); conn.close()
+    try:
+        row = conn.execute("SELECT * FROM stock WHERE part_code=? AND warehouse=? AND location=? AND batch=?", (code, warehouse, location, batch)).fetchone()
+        old = float(row["qty"]) if row else 0
+        diff = counted - old
+        comp = warehouse_company(conn, warehouse)
+        if row:
+            conn.execute("UPDATE stock SET qty=? WHERE id=?", (counted, row["id"]))
+        else:
+            conn.execute("INSERT INTO stock (part_code,warehouse,location,batch,qty,company_code) VALUES (?,?,?,?,?,?)", (code, warehouse, location, batch, counted, comp))
+        if abs(diff) > 1e-9:
+            add_ledger(code, diff, "盘点", payload.get("ref_no", "盘点"), f"盘点：账面 {old} → 实盘 {counted}，差异 {diff}", warehouse, batch, conn=conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
     if abs(diff) > 1e-9:
-        add_ledger(code, diff, "盘点", payload.get("ref_no", "盘点"), f"盘点：账面 {old} → 实盘 {counted}，差异 {diff}", warehouse, batch)
         log_audit(user, "盘点", "库存", code, "数量", str(old), str(counted), f"差异 {diff}@{warehouse}/{batch}")
     return {"ok": True, "part_code": code, "old_qty": old, "counted_qty": counted, "diff": diff}
 
@@ -1620,12 +1842,12 @@ def stock_freeze(payload: Dict[str, Any], x_user: Optional[str] = Header(None)):
     传 batch 则只冻该批次（校验该批次可用量）；不传 batch 则按汇总可用量冻（兼容第一阶段）。"""
     user = resolve_user(x_user)
     require_perm(user, "库存", "edit")
-    code = payload.get("part_code", ""); qty = float(payload.get("qty", 0) or 0)
+    code = payload.get("part_code", ""); qty = num_field(payload.get("qty"), "数量", required=True, positive=True)
     warehouse = payload.get("warehouse", "主仓")
     batch = payload.get("batch", "")
     check_scope(user, warehouse=warehouse)
-    if not code or qty <= 0:
-        raise HTTPException(400, "零件编码必填，数量必须 > 0")
+    if not code:
+        raise HTTPException(400, "零件编码必填")
     conn = get_conn()
     comp = warehouse_company(conn, warehouse)
     if batch:
@@ -1649,11 +1871,12 @@ def stock_unfreeze(payload: Dict[str, Any], x_user: Optional[str] = Header(None)
     """按批次解冻（大白话：之前冻住的某批次货又能用了）。传 batch/warehouse 则只解该批次；不传则按先进先出解最早的冻结。"""
     user = resolve_user(x_user)
     require_perm(user, "库存", "edit")
-    code = payload.get("part_code", ""); qty = float(payload.get("qty", 0) or 0)
+    code = payload.get("part_code", ""); qty = num_field(payload.get("qty"), "数量", required=True, positive=True)
     warehouse = payload.get("warehouse", "")
     batch = payload.get("batch", "")
-    if not code or qty <= 0:
-        raise HTTPException(400, "零件编码必填，数量必须 > 0")
+    check_scope(user, warehouse=warehouse or None)
+    if not code:
+        raise HTTPException(400, "零件编码必填")
     conn = get_conn()
     sql = "SELECT * FROM frozen_stock WHERE part_code=?"; args: List[Any] = [code]
     if warehouse:
@@ -1716,7 +1939,9 @@ def create_sales(o: SalesOrderIn, x_user: Optional[str] = Header(None)):
     return {"ok": True, "order_no": o.order_no}
 
 @app.put("/api/sales/{order_no}")
-def update_sales(order_no: str, payload: Dict[str, Any]):
+def update_sales(order_no: str, payload: Dict[str, Any], x_user: Optional[str] = Header(None)):
+    user = resolve_user(x_user)
+    require_perm(user, "销售", "edit")
     conn = get_conn()
     r = conn.execute("SELECT id FROM sales_orders WHERE order_no=?", (order_no,)).fetchone()
     if not r:
@@ -1729,7 +1954,9 @@ def update_sales(order_no: str, payload: Dict[str, Any]):
     return {"ok": True, "order_no": order_no}
 
 @app.delete("/api/sales/{order_no}")
-def delete_sales(order_no: str):
+def delete_sales(order_no: str, x_user: Optional[str] = Header(None)):
+    user = resolve_user(x_user)
+    require_perm(user, "销售", "delete")
     conn = get_conn()
     conn.execute("DELETE FROM sales_orders WHERE order_no=?", (order_no,))
     conn.execute("DELETE FROM mrp_results WHERE sales_order_no=?", (order_no,))
@@ -1737,7 +1964,9 @@ def delete_sales(order_no: str):
     return {"ok": True, "order_no": order_no}
 
 @app.post("/api/sales/{order_no}/create-production")
-def sales_create_production(order_no: str, payload: Dict[str, Any] = None):
+def sales_create_production(order_no: str, payload: Dict[str, Any] = None, x_user: Optional[str] = Header(None)):
+    user = resolve_user(x_user)
+    require_perm(user, "生产", "create")
     """销售单触发生产需求（大白话：客户下单了，就自动生成一张生产单，不做 CRM）"""
     conn = get_conn()
     so = conn.execute("SELECT * FROM sales_orders WHERE order_no=?", (order_no,)).fetchone()
@@ -1753,56 +1982,64 @@ def sales_create_production(order_no: str, payload: Dict[str, Any] = None):
 
 # ---------- MRP ----------
 @app.post("/api/mrp")
-def run_mrp(payload: Dict[str, Any]):
+def run_mrp(payload: Dict[str, Any], x_user: Optional[str] = Header(None)):
     """
     MRP 计算（多层 BOM 版）
-    步骤：1) 多层 BOM 爆炸得毛需求  2) 查可用库存/在途  3) 算净需求  4) 按提前期偏移算最晚下单日  5) 存结果
-    公式：净需求 = 毛需求 - 可用库存 - 在途 + 安全库存；最晚下单日 = 需求日期 - 提前期天数
+    步骤：1) 多层 BOM 爆炸得毛需求  2) 查可用量  3) 算净需求  4) 按提前期偏移算最晚下单日  5) 存结果
+    公式：净需求 = 毛需求 - 可用量 + 安全库存；可用量 = 现有 + 在途 - 已分配 - 冻结
+    （P0-3：以前只减“现有+在途”，没减已分配/冻结，和库存/看板/补货的口径不一致，会少买料）
+    最晚下单日 = 需求日期 - 提前期天数
     """
+    _u = resolve_user(x_user)
+    require_perm(_u, "采购", "view")
     sales_no = payload.get("sales_order_no", "")
     conn = get_conn()
-    so = conn.execute("SELECT * FROM sales_orders WHERE order_no=?", (sales_no,)).fetchone()
-    if not so:
+    try:
+        so = conn.execute("SELECT * FROM sales_orders WHERE order_no=?", (sales_no,)).fetchone()
+        if not so:
+            raise HTTPException(404, f"销售单 {sales_no} 不存在")
+        product = so["product_code"]
+        order_qty = float(so["qty"])
+        need_date = parse_date(so["due_date"]) or date.today()
+        mrp_company = payload.get("company_code") or so["company_code"] or "COMP-001"
+        mrp_warehouse = payload.get("warehouse") or so["warehouse"] or "主仓"
+        check_scope(_u, mrp_warehouse, mrp_company)
+        exploded = bom_explode(conn, product, order_qty)
+        conn.execute("DELETE FROM mrp_results WHERE sales_order_no=?", (sales_no,))
+        results = []
+        for it in exploded:
+            child = it["part_code"]
+            gross = float(it["qty"])
+            part = conn.execute("SELECT * FROM parts WHERE code=?", (child,)).fetchone()
+            safety = float(part["safety_stock"]) if part else 0
+            lead = int(part["lead_time_days"]) if part and part["lead_time_days"] is not None else 7
+            part_name = part["name"] if part else child
+            is_purchase = int(part["is_purchase"]) if part else 1
+            # 与“库存/看板/补货/领料”统一口径：现有 + 在途 - 已分配 - 冻结
+            available = get_available(child, mrp_warehouse, mrp_company)
+            onhand = get_onhand(child, mrp_warehouse, mrp_company)
+            in_transit = get_in_transit(child, mrp_warehouse, mrp_company)
+            net = gross - available + safety
+            if net < 0:
+                net = 0
+            latest = (need_date - timedelta(days=lead)).isoformat()
+            need_type = "采购" if is_purchase else "生产"
+            conn.execute("INSERT INTO mrp_results (sales_order_no,part_code,part_name,gross,onhand,in_transit,safety,net,adjusted_net,level,need_type,latest_order_date,created_at,company_code,warehouse) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                         (sales_no, child, part_name, gross, onhand, in_transit, safety, net, None, it["level"], need_type, latest, now_str(), mrp_company, mrp_warehouse))
+            results.append({"part_code": child, "part_name": part_name, "gross": gross, "onhand": onhand,
+                            "in_transit": in_transit, "available": available, "safety": safety,
+                            "net": net, "adjusted_net": None,
+                            "level": it["level"], "need_type": need_type, "latest_order_date": latest})
+        conn.commit()
+        return {"sales_order_no": sales_no, "results": results}
+    finally:
         conn.close()
-        raise HTTPException(404, f"销售单 {sales_no} 不存在")
-    product = so["product_code"]
-    order_qty = float(so["qty"])
-    need_date = parse_date(so["due_date"]) or date.today()
-    mrp_company = payload.get("company_code") or so["company_code"] or "COMP-001"
-    mrp_warehouse = payload.get("warehouse") or so["warehouse"] or "主仓"
-    exploded = bom_explode(conn, product, order_qty)
-    conn.execute("DELETE FROM mrp_results WHERE sales_order_no=?", (sales_no,))
-    results = []
-    for it in exploded:
-        child = it["part_code"]
-        gross = float(it["qty"])
-        part = conn.execute("SELECT * FROM parts WHERE code=?", (child,)).fetchone()
-        safety = float(part["safety_stock"]) if part else 0
-        lead = int(part["lead_time_days"]) if part and part["lead_time_days"] is not None else 7
-        part_name = part["name"] if part else child
-        is_purchase = int(part["is_purchase"]) if part else 1
-        onhand = float(conn.execute("SELECT COALESCE(SUM(qty),0) FROM stock WHERE part_code=? AND warehouse=? AND company_code=?", (child, mrp_warehouse, mrp_company)).fetchone()[0] or 0)
-        in_transit = float(conn.execute("""
-            SELECT COALESCE(SUM(poi.qty - poi.received_qty),0)
-            FROM purchase_order_items poi JOIN purchase_orders po ON po.order_no=poi.order_no
-            WHERE poi.part_code=? AND po.status IN ('新建','已下单','部分到货','已批准') AND poi.warehouse=? AND po.company_code=?
-        """, (child, mrp_warehouse, mrp_company)).fetchone()[0] or 0)
-        net = gross - onhand - in_transit + safety
-        if net < 0:
-            net = 0
-        latest = (need_date - timedelta(days=lead)).isoformat()
-        need_type = "采购" if is_purchase else "生产"
-        conn.execute("INSERT INTO mrp_results (sales_order_no,part_code,part_name,gross,onhand,in_transit,safety,net,adjusted_net,level,need_type,latest_order_date,created_at,company_code,warehouse) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                     (sales_no, child, part_name, gross, onhand, in_transit, safety, net, None, it["level"], need_type, latest, now_str(), mrp_company, mrp_warehouse))
-        results.append({"part_code": child, "part_name": part_name, "gross": gross, "onhand": onhand,
-                        "in_transit": in_transit, "safety": safety, "net": net, "adjusted_net": None,
-                        "level": it["level"], "need_type": need_type, "latest_order_date": latest})
-    conn.commit()
-    conn.close()
-    return {"sales_order_no": sales_no, "results": results}
 
 @app.get("/api/mrp/{sales_no}")
-def get_mrp(sales_no: str, warehouse: Optional[str] = None, company_code: Optional[str] = None):
+def get_mrp(sales_no: str, warehouse: Optional[str] = None, company_code: Optional[str] = None, x_user: Optional[str] = Header(None)):
+    user = resolve_user(x_user)
+    require_perm(user, "采购", "view")
+    check_scope(user, warehouse=warehouse, company_code=company_code)
     conn = get_conn()
     sql = "SELECT * FROM mrp_results WHERE sales_order_no=?"; args: List[Any] = [sales_no]
     if warehouse:
@@ -1815,7 +2052,9 @@ def get_mrp(sales_no: str, warehouse: Optional[str] = None, company_code: Option
     return [row_to_dict(r) for r in rows]
 
 @app.put("/api/mrp/adjust")
-def adjust_mrp(payload: Dict[str, Any]):
+def adjust_mrp(payload: Dict[str, Any], x_user: Optional[str] = Header(None)):
+    user = resolve_user(x_user)
+    require_perm(user, "采购", "edit")
     """MRP 手动调整（大白话：系统算出来的数，人工可以改，改完再生成采购单/生产单）"""
     sales_no = payload.get("sales_order_no", "")
     part_code = payload.get("part_code", "")
@@ -1840,7 +2079,9 @@ def _mrp_effective_qty(row) -> float:
     return float(row["net"])
 
 @app.post("/api/mrp/generate")
-def mrp_generate(payload: Dict[str, Any]):
+def mrp_generate(payload: Dict[str, Any], x_user: Optional[str] = Header(None)):
+    user = resolve_user(x_user)
+    require_perm(user, "采购", "create")
     """
     MRP 一键生成：采购件按推荐供应商分组生成采购单（第三阶段：均衡推荐——最便宜且能按时到货的优先，
     赶不上需求日时在能按时到货的里面选最便宜的，黑名单跳过），半成品/成品需求生成生产单。返回生成的单号。
@@ -1929,20 +2170,34 @@ def create_requisition(payload: Dict[str, Any], x_user: Optional[str] = Header(N
     check_scope(user, warehouse=warehouse, company_code=company_code)
     conn = get_conn()
     rate = resolve_exchange_rate(conn, currency, "CNY", payload.get("exchange_rate") or None) if currency != "CNY" else 1.0
-    subtotal = sum(float(it["qty"]) * float(it.get("price", 0) or 0) for it in items)
-    total = subtotal * 1.13
+    # P1-2：按零件档案税率算税，不再整张单写死 13%
+    subtotal = 0.0; tax_total = 0.0
+    for it in items:
+        if not isinstance(it, dict) or not it.get("part_code"):
+            raise HTTPException(422, "采购申请明细缺少 part_code（零件编码）")
+        qty = num_field(it.get("qty"), "明细数量", required=True, positive=True)
+        price = num_field(it.get("price", 0), "明细单价")
+        p = conn.execute("SELECT tax_rate FROM parts WHERE code=?", (it["part_code"],)).fetchone()
+        tax = float(p["tax_rate"]) if p and p["tax_rate"] is not None else 0.13
+        it["_qty"] = qty; it["_price"] = price; it["_tax"] = tax
+        subtotal += qty * price; tax_total += qty * price * tax
+    total = subtotal + tax_total
     req_no = payload.get("req_no") or next_doc_no(conn, "PR")
     try:
         conn.execute("INSERT INTO purchase_requisitions (req_no,applicant,reason,status,created_at,company_code,warehouse,currency,exchange_rate,total_amount,total_amount_base) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                      (req_no, payload.get("applicant", ""), payload.get("reason", ""), "新建", now_str(), company_code, warehouse, currency, rate, round(total, 2), round(total * rate, 2)))
         for it in items:
             conn.execute("INSERT INTO purchase_requisition_items (req_no,part_code,qty,price,supplier_code) VALUES (?,?,?,?,?)",
-                         (req_no, it["part_code"], float(it["qty"]), float(it.get("price", 0) or 0), it.get("supplier_code", "")))
+                         (req_no, it["part_code"], it["_qty"], it["_price"], it.get("supplier_code", "")))
         conn.commit()
     except sqlite3.IntegrityError:
-        conn.close()
+        conn.rollback()
         raise HTTPException(400, f"采购申请号 {req_no} 已存在")
-    conn.close()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
     log_audit(user, "创建", "采购申请", req_no, "金额", "", str(round(total, 2)), f"{currency} 合计 {round(total,2)}", company_code)
     return {"ok": True, "req_no": req_no, "status": "新建", "total_amount": round(total, 2)}
 
@@ -2028,37 +2283,48 @@ def reject_requisition(req_no: str, payload: Dict[str, Any] = None, x_user: Opti
     return {"ok": True, "req_no": req_no, "status": final}
 
 @app.post("/api/purchase/requisitions/{req_no}/convert")
-def convert_requisition(req_no: str):
-    """申请转采购单：已批准的申请按供应商分组生成采购单（同供应商合并）"""
+def convert_requisition(req_no: str, x_user: Optional[str] = Header(None)):
+    """申请转采购单：已批准的申请按供应商分组生成采购单（同供应商合并）。
+    P0-4 补权限；P1-2 税率改为取零件档案税率，不再全写死 0.13。"""
+    user = resolve_user(x_user)
+    require_perm(user, "采购", "create")
     conn = get_conn()
-    r = conn.execute("SELECT * FROM purchase_requisitions WHERE req_no=?", (req_no,)).fetchone()
-    if not r:
+    try:
+        r = conn.execute("SELECT * FROM purchase_requisitions WHERE req_no=?", (req_no,)).fetchone()
+        if not r:
+            raise HTTPException(404, f"采购申请 {req_no} 不存在")
+        check_scope(user, warehouse=r["warehouse"], company_code=r["company_code"])
+        if r["status"] != "已批准":
+            raise HTTPException(400, f"采购申请 {req_no} 状态是 {r['status']}，只有已批准才能转采购单")
+        items = conn.execute("SELECT * FROM purchase_requisition_items WHERE req_no=?", (req_no,)).fetchall()
+        groups: Dict[str, List] = {}
+        for it in items:
+            sup = it["supplier_code"] or "SUP-001"
+            groups.setdefault(sup, []).append(it)
+        po_nos = []
+        for sup, grp in groups.items():
+            po_no = next_doc_no(conn, "PO")
+            total = 0; subtotal = 0; tax_total = 0
+            conn.execute("INSERT INTO purchase_orders (order_no,supplier_code,status,due_date,total_amount,created_at,company_code,warehouse,currency,exchange_rate,total_amount_base,subtotal_amount,tax_amount) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                         (po_no, sup, "已下单", TODAY, 0, now_str(), r["company_code"], r["warehouse"], r["currency"], r["exchange_rate"], 0, 0, 0))
+            for it in grp:
+                p = conn.execute("SELECT tax_rate FROM parts WHERE code=?", (it["part_code"],)).fetchone()
+                tax = float(p["tax_rate"]) if p and p["tax_rate"] is not None else 0.13
+                qty = float(it["qty"]); price = float(it["price"])
+                conn.execute("INSERT INTO purchase_order_items (order_no,part_code,qty,price,received_qty,tax_rate,warehouse,company_code) VALUES (?,?,?,?,?,?,?,?)",
+                             (po_no, it["part_code"], qty, price, 0, tax, r["warehouse"], r["company_code"]))
+                subtotal += qty * price; tax_total += qty * price * tax
+                total += qty * price * (1 + tax)
+            conn.execute("UPDATE purchase_orders SET total_amount=?, total_amount_base=?, subtotal_amount=?, tax_amount=? WHERE order_no=?",
+                         (round(total, 2), round(total * float(r["exchange_rate"] or 1), 2), round(subtotal, 2), round(tax_total, 2), po_no))
+            po_nos.append(po_no)
+        conn.execute("UPDATE purchase_requisitions SET status='已转采购单' WHERE req_no=?", (req_no,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
         conn.close()
-        raise HTTPException(404, f"采购申请 {req_no} 不存在")
-    if r["status"] != "已批准":
-        conn.close()
-        raise HTTPException(400, f"采购申请 {req_no} 状态是 {r['status']}，只有已批准才能转采购单")
-    items = conn.execute("SELECT * FROM purchase_requisition_items WHERE req_no=?", (req_no,)).fetchall()
-    groups: Dict[str, List] = {}
-    for it in items:
-        sup = it["supplier_code"] or "SUP-001"
-        groups.setdefault(sup, []).append(it)
-    po_nos = []
-    for sup, grp in groups.items():
-        po_no = next_doc_no(conn, "PO")
-        total = 0; subtotal = 0; tax_total = 0
-        conn.execute("INSERT INTO purchase_orders (order_no,supplier_code,status,due_date,total_amount,created_at,company_code,warehouse,currency,exchange_rate,total_amount_base,subtotal_amount,tax_amount) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                     (po_no, sup, "已下单", TODAY, 0, now_str(), r["company_code"], r["warehouse"], r["currency"], r["exchange_rate"], 0, 0, 0))
-        for it in grp:
-            conn.execute("INSERT INTO purchase_order_items (order_no,part_code,qty,price,received_qty,tax_rate,warehouse,company_code) VALUES (?,?,?,?,?,?,?,?)",
-                         (po_no, it["part_code"], float(it["qty"]), float(it["price"]), 0, 0.13, r["warehouse"], r["company_code"]))
-            subtotal += float(it["qty"]) * float(it["price"]); tax_total += float(it["qty"]) * float(it["price"]) * 0.13
-            total += float(it["qty"]) * float(it["price"]) * 1.13
-        conn.execute("UPDATE purchase_orders SET total_amount=?, total_amount_base=?, subtotal_amount=?, tax_amount=? WHERE order_no=?",
-                     (round(total, 2), round(total * float(r["exchange_rate"] or 1), 2), round(subtotal, 2), round(tax_total, 2), po_no))
-        po_nos.append(po_no)
-    conn.execute("UPDATE purchase_requisitions SET status='已转采购单' WHERE req_no=?", (req_no,))
-    conn.commit(); conn.close()
     return {"ok": True, "req_no": req_no, "purchase_orders": po_nos}
 
 # ---------- 采购 ----------
@@ -2117,17 +2383,28 @@ def create_purchase(payload: Dict[str, Any], x_user: Optional[str] = Header(None
         conn.execute("INSERT INTO purchase_orders (order_no,supplier_code,status,due_date,total_amount,created_at,company_code,warehouse,currency,exchange_rate,total_amount_base,subtotal_amount,tax_amount) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                      (order_no, payload.get("supplier_code", "SUP-001"), "新建", payload.get("due_date", TODAY), 0, now_str(), company_code, warehouse, currency, rate, 0, 0, 0))
         for it in items:
-            price = float(it.get("price", 0) or 0); tax = float(it.get("tax_rate", 0.13) or 0.13)
+            if not isinstance(it, dict) or not it.get("part_code"):
+                raise HTTPException(422, "采购明细缺少 part_code（零件编码）")
+            qty = num_field(it.get("qty"), "明细数量", required=True, positive=True)
+            price = num_field(it.get("price", 0), "明细单价")
+            tax = num_field(it.get("tax_rate", 0.13), "明细税率", default=0.13)
             conn.execute("INSERT INTO purchase_order_items (order_no,part_code,qty,price,received_qty,tax_rate,warehouse,company_code) VALUES (?,?,?,?,?,?,?,?)",
-                         (order_no, it["part_code"], float(it["qty"]), price, 0, tax, warehouse, company_code))
-            subtotal += float(it["qty"]) * price; tax_total += float(it["qty"]) * price * tax; total += float(it["qty"]) * price * (1 + tax)
+                         (order_no, it["part_code"], qty, price, 0, tax, warehouse, company_code))
+            subtotal += qty * price; tax_total += qty * price * tax; total += qty * price * (1 + tax)
         conn.execute("UPDATE purchase_orders SET total_amount=?, total_amount_base=?, subtotal_amount=?, tax_amount=? WHERE order_no=?",
                      (round(total, 2), round(total * rate, 2), round(subtotal, 2), round(tax_total, 2), order_no))
         conn.commit()
     except sqlite3.IntegrityError:
-        conn.close()
+        conn.rollback()
         raise HTTPException(400, f"采购单号 {order_no} 已存在")
-    conn.close()
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
     log_audit(user, "创建", "采购单", order_no, "金额", "", str(round(total, 2)), f"{currency} 合计 {round(total,2)}，本位币 {round(total*rate,2)}", company_code)
     return {"ok": True, "order_no": order_no, "total_amount": round(total, 2), "total_amount_base": round(total * rate, 2)}
 
@@ -2197,66 +2474,79 @@ def reject_po(order_no: str, payload: Dict[str, Any] = None, x_user: Optional[st
     return {"ok": True, "order_no": order_no, "status": final}
 
 @app.post("/api/purchase/from-mrp")
-def purchase_from_mrp(payload: Dict[str, Any]):
+def purchase_from_mrp(payload: Dict[str, Any], x_user: Optional[str] = Header(None)):
     """
     从 MRP 一键生成采购单（兼容 MVP）
     逻辑：取 MRP 结果（调整后数量优先），按推荐供应商分组（第三阶段：均衡推荐，最便宜优先，黑名单跳过），
     同一供应商合并成一张采购单。指定 supplier_code 时，全部归到该供应商一张单。
+    P0-4：补权限与公司/仓库范围校验。
     """
+    user = resolve_user(x_user)
+    require_perm(user, "采购", "create")
     sales_no = payload.get("sales_order_no", "")
     supplier_override = payload.get("supplier_code")
     conn = get_conn()
-    mrp = conn.execute("SELECT * FROM mrp_results WHERE sales_order_no=? AND need_type='采购'", (sales_no,)).fetchall()
-    if not mrp:
-        conn.close()
-        raise HTTPException(400, "MRP 结果为空或全部不缺料，请先跑 MRP")
-    groups: Dict[str, List] = {}
-    for r in mrp:
-        qty = _mrp_effective_qty(r)
-        if qty <= 0:
-            continue
-        if supplier_override:
-            sup = supplier_override
-        else:
-            rec, _rs, _et = recommend_supplier_for(conn, r["part_code"])
-            sup = rec["supplier_code"] if rec is not None else "SUP-001"
-        groups.setdefault(sup, []).append((r, qty))
-    if not groups:
-        conn.close()
-        raise HTTPException(400, "MRP 结果全部不缺料，无需生成采购单")
-    po_nos = []
-    first_total = 0
-    for sup, items in groups.items():
-        order_no = next_doc_no(conn, "PO")
-        total = 0; subtotal = 0; tax_total = 0
-        _comp = items[0][0]["company_code"] if "company_code" in items[0][0].keys() else "COMP-001"
-        _wh = items[0][0]["warehouse"] if "warehouse" in items[0][0].keys() else "主仓"
-        conn.execute("INSERT INTO purchase_orders (order_no,supplier_code,status,due_date,total_amount,created_at,company_code,warehouse,currency,exchange_rate,total_amount_base,subtotal_amount,tax_amount) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                     (order_no, sup, "已下单", TODAY, 0, now_str(), _comp, _wh, "CNY", 1, 0, 0, 0))
-        for r, qty in items:
-            part = conn.execute("SELECT * FROM parts WHERE code=?", (r["part_code"],)).fetchone()
+    try:
+        mrp = conn.execute("SELECT * FROM mrp_results WHERE sales_order_no=? AND need_type='采购'", (sales_no,)).fetchall()
+        if not mrp:
+            raise HTTPException(400, "MRP 结果为空或全部不缺料，请先跑 MRP")
+        for r in mrp:
+            check_scope(user, warehouse=r["warehouse"] if "warehouse" in r.keys() else None,
+                        company_code=r["company_code"] if "company_code" in r.keys() else None)
+        groups: Dict[str, List] = {}
+        for r in mrp:
+            qty = _mrp_effective_qty(r)
+            if qty <= 0:
+                continue
             if supplier_override:
-                price = float(part["price"]) if part else 0
-                tax_rate = float(part["tax_rate"]) if part else 0.13
+                sup = supplier_override
             else:
-                rec, _rs2, _et2 = recommend_supplier_for(conn, r["part_code"])
-                price = float(rec["price"]) if rec is not None else (float(part["price"]) if part else 0)
-                tax_rate = float(rec["tax_rate"]) if rec is not None else 0.13
-            conn.execute("INSERT INTO purchase_order_items (order_no,part_code,qty,price,received_qty,tax_rate,warehouse,company_code) VALUES (?,?,?,?,?,?,?,?)",
-                         (order_no, r["part_code"], qty, price, 0, tax_rate, _wh, _comp))
-            subtotal += qty * price; tax_total += qty * price * tax_rate; total += qty * price * (1 + tax_rate)
-        total_with_tax = round(total, 2)
-        conn.execute("UPDATE purchase_orders SET total_amount=?, total_amount_base=?, subtotal_amount=?, tax_amount=? WHERE order_no=?",
-                     (total_with_tax, total_with_tax, round(subtotal, 2), round(tax_total, 2), order_no))
-        po_nos.append(order_no)
-        first_total = total_with_tax
-    conn.commit(); conn.close()
+                rec, _rs, _et = recommend_supplier_for(conn, r["part_code"])
+                sup = rec["supplier_code"] if rec is not None else "SUP-001"
+            groups.setdefault(sup, []).append((r, qty))
+        if not groups:
+            raise HTTPException(400, "MRP 结果全部不缺料，无需生成采购单")
+        po_nos = []
+        first_total = 0
+        for sup, items in groups.items():
+            order_no = next_doc_no(conn, "PO")
+            total = 0; subtotal = 0; tax_total = 0
+            _comp = items[0][0]["company_code"] if "company_code" in items[0][0].keys() else "COMP-001"
+            _wh = items[0][0]["warehouse"] if "warehouse" in items[0][0].keys() else "主仓"
+            conn.execute("INSERT INTO purchase_orders (order_no,supplier_code,status,due_date,total_amount,created_at,company_code,warehouse,currency,exchange_rate,total_amount_base,subtotal_amount,tax_amount) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                         (order_no, sup, "已下单", TODAY, 0, now_str(), _comp, _wh, "CNY", 1, 0, 0, 0))
+            for r, qty in items:
+                part = conn.execute("SELECT * FROM parts WHERE code=?", (r["part_code"],)).fetchone()
+                if supplier_override:
+                    price = float(part["price"]) if part else 0
+                    tax_rate = float(part["tax_rate"]) if part else 0.13
+                else:
+                    rec, _rs2, _et2 = recommend_supplier_for(conn, r["part_code"])
+                    price = float(rec["price"]) if rec is not None else (float(part["price"]) if part else 0)
+                    tax_rate = float(rec["tax_rate"]) if rec is not None else 0.13
+                conn.execute("INSERT INTO purchase_order_items (order_no,part_code,qty,price,received_qty,tax_rate,warehouse,company_code) VALUES (?,?,?,?,?,?,?,?)",
+                             (order_no, r["part_code"], qty, price, 0, tax_rate, _wh, _comp))
+                subtotal += qty * price; tax_total += qty * price * tax_rate; total += qty * price * (1 + tax_rate)
+            total_with_tax = round(total, 2)
+            # 修复：subtotal/tax 拆开存（以前把含税总额又写进 subtotal，导致“未税金额=含税金额”）
+            conn.execute("UPDATE purchase_orders SET total_amount=?, total_amount_base=?, subtotal_amount=?, tax_amount=? WHERE order_no=?",
+                         (total_with_tax, total_with_tax, round(subtotal, 2), round(tax_total, 2), order_no))
+            po_nos.append(order_no)
+            first_total = total_with_tax
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
     # 兼容 MVP：返回单个 order_no（单供应商时就是那张单）
     return {"ok": True, "order_no": po_nos[0], "purchase_orders": po_nos, "total_amount_with_tax": first_total}
 
 @app.post("/api/purchase/merge")
-def merge_purchase(payload: Dict[str, Any]):
-    """采购单合并（大白话：同供应商的几张单合并成一张，省运费、好对账）"""
+def merge_purchase(payload: Dict[str, Any], x_user: Optional[str] = Header(None)):
+    """采购单合并（大白话：同供应商的几张单合并成一张，省运费、好对账）。P0-4：补权限与范围校验"""
+    user = resolve_user(x_user)
+    require_perm(user, "采购", "edit")
     order_nos = payload.get("order_nos", [])
     supplier_override = payload.get("supplier_code")
     if len(order_nos) < 2:
@@ -2269,8 +2559,8 @@ def merge_purchase(payload: Dict[str, Any]):
             conn.close()
             raise HTTPException(404, f"采购单 {no} 不存在")
         if po["status"] not in ("新建", "已下单"):
-            conn.close()
             raise HTTPException(400, f"采购单 {no} 状态是 {po['status']}，只有新建/已下单才能合并")
+        check_scope(user, warehouse=po["warehouse"], company_code=po["company_code"])
         pos.append(po)
     companies = {p["company_code"] for p in pos}
     if len(companies) > 1:
@@ -2300,7 +2590,7 @@ def merge_purchase(payload: Dict[str, Any]):
     for po in pos:
         conn.execute("UPDATE purchase_orders SET status='已合并' WHERE order_no=?", (po["order_no"],))
     conn.commit(); conn.close()
-    log_audit("admin", "合并", "采购单", new_no, "来源单", ",".join(order_nos), new_no, f"合并后含税 {round(total,2)}")
+    log_audit(user, "合并", "采购单", new_no, "来源单", ",".join(order_nos), new_no, f"合并后含税 {round(total,2)}")
     return {"ok": True, "order_no": new_no, "merged_from": order_nos, "total_amount_with_tax": round(total, 2)}
 
 @app.post("/api/purchase/receive")
@@ -2325,37 +2615,40 @@ def purchase_receive(r: ReceiveIn, x_user: Optional[str] = Header(None)):
     if float(item["received_qty"]) + float(r.qty) > float(item["qty"]) + 1e-9:
         conn.close()
         raise HTTPException(400, "到货数量超过采购数量")
-    conn.execute("UPDATE purchase_order_items SET received_qty=received_qty+? WHERE id=?", (r.qty, item["id"]))
-    items2 = conn.execute("SELECT * FROM purchase_order_items WHERE order_no=?", (r.order_no,)).fetchall()
-    total_qty = sum(float(x["qty"]) for x in items2)
-    total_recv = sum(float(x["received_qty"]) for x in items2)
-    if total_recv >= total_qty - 1e-9:
-        new_status = "全部到货"
-    elif total_recv > 0:
-        new_status = "部分到货"
-    else:
-        new_status = "已下单"
-    if new_status == "全部到货":
-        conn.execute("UPDATE purchase_orders SET status=?, received_date=? WHERE order_no=?", (new_status, TODAY, r.order_no))
-    else:
-        conn.execute("UPDATE purchase_orders SET status=? WHERE order_no=?", (new_status, r.order_no))
-    conn.commit()
-    conn.close()
-    if r.qc_result == "不合格":
-        # 质检不合格：不进库存，按批次进冻结（大白话：货到了但不能用，等处理；哪个批次冻的，解冻时按批次解）
-        conn2 = get_conn()
-        batch_qc = r.batch or "BATCH-20261019"
-        wh_qc = r.warehouse or po["warehouse"]
-        conn2.execute("INSERT INTO frozen_stock (part_code,qty,reason,ref_no,created_at,warehouse,location,batch,company_code) VALUES (?,?,?,?,?,?,?,?,?)",
-                      (r.part_code, float(r.qty), "质检不合格冻结", r.order_no, now_str(), wh_qc, r.location or "", batch_qc, po["company_code"]))
-        conn2.commit(); conn2.close()
-        add_ledger(r.part_code, 0, "质检不合格", r.order_no, f"到货 {r.qty} 质检不合格，已冻结（{wh_qc}/{batch_qc}）", wh_qc, batch_qc)
-        log_audit(user, "质检不合格冻结", "采购单", r.order_no, "冻结量", "", str(r.qty), f"{r.part_code} {wh_qc}/{batch_qc}", po["company_code"])
-        return {"ok": True, "order_no": r.order_no, "part_code": r.part_code, "received": r.qty, "status": new_status, "qc": "不合格，已冻结"}
-    batch = r.batch or "BATCH-20261019"
-    location = r.location or "A区-01"
     wh = r.warehouse or po["warehouse"]
-    adjust_stock(r.part_code, float(r.qty), "采购入库", r.order_no, wh, location, batch)
+    batch = r.batch or DEFAULT_BATCH
+    location = r.location or DEFAULT_LOCATION
+    try:
+        conn.execute("UPDATE purchase_order_items SET received_qty=received_qty+? WHERE id=?", (r.qty, item["id"]))
+        items2 = conn.execute("SELECT * FROM purchase_order_items WHERE order_no=?", (r.order_no,)).fetchall()
+        total_qty = sum(float(x["qty"]) for x in items2)
+        total_recv = sum(float(x["received_qty"]) for x in items2)
+        if total_recv >= total_qty - 1e-9:
+            new_status = "全部到货"
+        elif total_recv > 0:
+            new_status = "部分到货"
+        else:
+            new_status = "已下单"
+        if new_status == "全部到货":
+            conn.execute("UPDATE purchase_orders SET status=?, received_date=? WHERE order_no=?", (new_status, TODAY, r.order_no))
+        else:
+            conn.execute("UPDATE purchase_orders SET status=? WHERE order_no=?", (new_status, r.order_no))
+        if r.qc_result == "不合格":
+            # 质检不合格：不进可用库存，按“这次到货的批次/库位”整批冻结（P1-5：批次不再写死）
+            conn.execute("INSERT INTO frozen_stock (part_code,qty,reason,ref_no,created_at,warehouse,location,batch,company_code) VALUES (?,?,?,?,?,?,?,?,?)",
+                         (r.part_code, float(r.qty), "质检不合格冻结", r.order_no, now_str(), wh, location, batch, po["company_code"]))
+            add_ledger(r.part_code, 0, "质检不合格", r.order_no, f"到货 {r.qty} 质检不合格，已冻结（{wh}/{batch}）", wh, batch, po["company_code"], conn=conn)
+        else:
+            adjust_stock(r.part_code, float(r.qty), "采购入库", r.order_no, wh, location, batch, po["company_code"], conn=conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    if r.qc_result == "不合格":
+        log_audit(user, "质检不合格冻结", "采购单", r.order_no, "冻结量", "", str(r.qty), f"{r.part_code} {wh}/{batch}", po["company_code"])
+        return {"ok": True, "order_no": r.order_no, "part_code": r.part_code, "received": r.qty, "status": new_status, "qc": "不合格，已冻结"}
     log_audit(user, "到货入库", "采购单", r.order_no, "到货量", "", str(r.qty), f"{r.part_code} {wh}/{batch}", po["company_code"])
     return {"ok": True, "order_no": r.order_no, "part_code": r.part_code, "received": r.qty, "status": new_status, "qc": "合格"}
 
@@ -2424,28 +2717,31 @@ def create_production(payload: Dict[str, Any], x_user: Optional[str] = Header(No
     user = resolve_user(x_user)
     require_perm(user, "生产", "create")
     product = payload.get("product_code", "FG-001")
-    qty = float(payload.get("qty", 100))
+    qty = num_field(payload.get("qty", 100), "生产数量", required=True, positive=True)
     sales_no = payload.get("sales_order_no", "")
     planned_start = payload.get("planned_start", "")
     planned_end = payload.get("planned_end", "")
     company_code = payload.get("company_code", "COMP-001")
     warehouse = payload.get("warehouse", "主仓")
     check_scope(user, warehouse=warehouse, company_code=company_code)
-    if qty <= 0:
-        raise HTTPException(400, "生产数量必须 > 0")
     if planned_start and planned_end and planned_end < planned_start:
         raise HTTPException(400, "计划结束不能早于计划开始")
     conn = get_conn()
-    order_no = payload.get("order_no") or next_doc_no(conn, "MO")
+    order_no = payload.get("order_no") or ""
     try:
+        order_no = payload.get("order_no") or next_doc_no(conn, "MO")
         conn.execute("INSERT INTO production_orders (order_no,product_code,qty,status,sales_order_no,created_at,planned_start,planned_end,company_code,warehouse,parent_order_no) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                      (order_no, product, qty, "新建", sales_no, now_str(), planned_start, planned_end, company_code, warehouse, payload.get("parent_order_no", "")))
         _allocate_for_production(conn, order_no, product, qty, warehouse, company_code)
         conn.commit()
     except sqlite3.IntegrityError:
-        conn.close()
+        conn.rollback()
         raise HTTPException(400, f"生产单号 {order_no} 已存在")
-    conn.close()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
     log_audit(user, "创建", "生产单", order_no, "数量", "", str(qty), f"{product} x {qty}@{warehouse}", company_code)
     return {"ok": True, "order_no": order_no}
 
@@ -2594,23 +2890,36 @@ def production_complete(payload: Dict[str, Any], x_user: Optional[str] = Header(
         conn.close()
         raise HTTPException(400, f"生产单 {order_no} 状态是 {mo['status']}，请先领料再完工")
     conn.execute("UPDATE production_orders SET status='已完工' WHERE order_no=?", (order_no,))
-    conn.commit()
-    conn.close()
-    adjust_stock(mo["product_code"], float(mo["qty"]), "生产入库", order_no, mo["warehouse"], "A区-01", "BATCH-20261019")
+    # P1-6：完工状态 + 成品入库 + 库存流水必须在同一个事务里，不能“状态已完工但入库失败”
+    try:
+        adjust_stock(mo["product_code"], float(mo["qty"]), "生产入库", order_no, mo["warehouse"],
+                     DEFAULT_LOCATION, DEFAULT_BATCH, mo["company_code"], conn=conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
     log_audit(user, "完工入库", "生产单", order_no, "状态", "已领料", "已完工", f"{mo['product_code']} x {mo['qty']}@{mo['warehouse']}", mo["company_code"])
     return {"ok": True, "order_no": order_no, "status": "已完工", "finished_qty": float(mo["qty"])}
 
 # ---------- 看板（四块 + 红黄绿） ----------
 @app.get("/api/dashboard")
-def dashboard():
+def dashboard(x_user: Optional[str] = Header(None)):
+    """经营看板。P0-4：补权限（报表 view）+ 按公司/仓库范围过滤，非管理员看不到别家公司数据。"""
+    user = resolve_user(x_user)
+    require_perm(user, "报表", "view")
+    ac = allowed_companies(user); aw = allowed_warehouses(user)
     conn = get_conn()
-    # 1) 缺料预警：按可用量（不是现有量）判断
+    # 1) 缺料预警：按可用量（不是现有量）判断；只看权限范围内的零件
     parts = conn.execute("SELECT * FROM parts ORDER BY code").fetchall()
     conn.close()
+    if ac:
+        parts = [p for p in parts if (p["company_code"] if "company_code" in p.keys() else "COMP-001") in ac]
     shortage_items = []
     for p in parts:
         code = p["code"]
-        avail = get_available(code)
+        avail = available_in_scope(code, user)
         st = stock_status(avail, float(p["safety_stock"] or 0), float(p["max_stock"] or 0))
         if st in ("红", "黄"):
             reason = "已断货" if avail <= 0 else ("低于安全库存" if avail < float(p["safety_stock"] or 0) else "高于最高库存")
@@ -2618,9 +2927,15 @@ def dashboard():
                                    "safety_stock": p["safety_stock"], "max_stock": p["max_stock"],
                                    "status": st, "reason": reason})
     shortage_status = "红" if any(x["status"] == "红" for x in shortage_items) else ("黄" if shortage_items else "绿")
-    # 2) 拖期采购
+    # 2) 拖期采购（按范围过滤）
+    po_sql = "SELECT * FROM purchase_orders WHERE status IN ('新建','已下单','部分到货')"
+    po_args: List[Any] = []
+    if ac:
+        po_sql += " AND company_code IN (%s)" % ",".join("?" * len(ac)); po_args.extend(ac)
+    if aw:
+        po_sql += " AND warehouse IN (%s)" % ",".join("?" * len(aw)); po_args.extend(aw)
     conn = get_conn()
-    pos = conn.execute("SELECT * FROM purchase_orders WHERE status IN ('新建','已下单','部分到货')").fetchall()
+    pos = conn.execute(po_sql, po_args).fetchall()
     conn.close()
     overdue_items = []
     for po in pos:
@@ -2639,6 +2954,8 @@ def dashboard():
     conn = get_conn()
     mos = conn.execute("SELECT * FROM production_orders WHERE status='新建'").fetchall()
     conn.close()
+    if ac:
+        mos = [m for m in mos if (m["company_code"] if "company_code" in m.keys() else "COMP-001") in ac]
     prod_shortage = []
     for mo in mos:
         conn2 = get_conn()
@@ -2646,7 +2963,7 @@ def dashboard():
         conn2.close()
         missing = []
         for it in leaves:
-            avail = get_available(it["part_code"])
+            avail = available_in_scope(it["part_code"], user)
             # 可用量里已包含本单的占用，要把本单占用加回来才是“本单能不能领”
             own_alloc = 0
             conn3 = get_conn()
@@ -2664,7 +2981,10 @@ def dashboard():
     try:
         conn_r = get_conn()
         repl_items = []
-        for p in conn_r.execute("SELECT * FROM parts ORDER BY code").fetchall():
+        repl_parts = conn_r.execute("SELECT * FROM parts ORDER BY code").fetchall()
+        if ac:
+            repl_parts = [p for p in repl_parts if (p["company_code"] if "company_code" in p.keys() else "COMP-001") in ac]
+        for p in repl_parts:
             it = replenishment_for_part(conn_r, p, 30)
             if it["need_reorder"]:
                 repl_items.append(it)
@@ -2688,34 +3008,36 @@ def dashboard():
 
 # ---------- Excel 导入导出 ----------
 COLUMN_ALIASES = {
-    "code": ["编码", "零件编码", "物料编码", "材料编码", "料号", "code", "part_code", "零件编号", "物料编号"],
-    "name": ["名称", "零件名称", "物料名称", "材料名称", "品名", "name"],
+    "code": ["编码", "零件编码", "物料编码", "材料编码", "料号", "code", "part_code", "零件编号", "物料编号", "零件号", "物料号"],
+    "name": ["名称", "零件名称", "物料名称", "材料名称", "品名", "name", "物料说明", "零件名"],
     "spec": ["规格", "规格型号", "spec"],
     "unit": ["单位", "unit"],
     "category": ["类别", "分类", "category"],
-    "safety_stock": ["安全库存", "安全库存量", "safety_stock"],
+    "safety_stock": ["安全库存", "安全库存量", "安全存量", "safety_stock"],
     "min_stock": ["最低库存", "min_stock"],
     "max_stock": ["最高库存", "max_stock"],
-    "lead_time_days": ["提前期", "提前期天数", "lead_time_days", "交期天数"],
+    "lead_time_days": ["提前期", "提前期天数", "lead_time_days", "交期天数", "采购提前期", "生产提前期"],
     "price": ["单价", "未税单价", "价格", "price"],
     "tax_rate": ["税率", "tax_rate"],
-    "qty": ["数量", "用量", "库存数量", "库存", "qty", "期末数量", "结存数量"],
-    "warehouse": ["仓库", "warehouse"],
-    "location": ["库位", "货位", "location"],
-    "batch": ["批次", "批次号", "batch"],
+    "qty": ["数量", "用量", "库存数量", "库存", "qty", "期末数量", "结存数量",
+            "需求数量", "需求数", "需求量", "建议数量", "补货数量", "到货数量"],
+    "warehouse": ["仓库", "warehouse", "仓库名称", "库房"],
+    "location": ["库位", "货位", "location", "库位号"],
+    "batch": ["批次", "批次号", "batch", "批号"],
     "supplier_code": ["供应商编码", "供应商", "supplier_code"],
     "is_purchase": ["是否采购件", "采购件", "is_purchase"],
     "supplier_name": ["供应商名称", "供应商名"],
-    "order_no": ["单号", "采购单号", "采购单", "order_no", "单据号", "销售单号", "生产单号"],
-    "part_code": ["零件编码", "物料编码", "材料编码", "料号", "part_code"],
+    "order_no": ["单号", "采购单号", "采购单", "order_no", "单据号", "销售单号", "生产单号",
+                 "订单号", "订单编号", "采购订单号", "销售订单号", "生产订单号"],
+    "part_code": ["零件编码", "物料编码", "材料编码", "料号", "part_code", "零件号", "物料号"],
     "parent_code": ["父件编码", "父件", "成品编码", "成品", "parent_code"],
     "child_code": ["子件编码", "子件", "child_code"],
     "version": ["版本号", "版本", "version"],
     "effective_date": ["生效日期", "生效时间", "effective_date"],
     "loss_rate": ["损耗率", "损耗", "loss_rate"],
     "customer": ["客户", "客户名称", "customer"],
-    "product_code": ["成品编码", "产品编码", "product_code"],
-    "due_date": ["交期", "需求日期", "到期日期", "due_date"],
+    "product_code": ["成品编码", "产品编码", "product_code", "产品", "产品名称", "产品型号"],
+    "due_date": ["交期", "需求日期", "到期日期", "due_date", "交货日期", "要求交期"],
     "status": ["状态", "status"],
     "planned_start": ["计划开始", "计划开始日期", "planned_start"],
     "planned_end": ["计划结束", "计划结束日期", "planned_end"],
@@ -2727,7 +3049,7 @@ COLUMN_ALIASES = {
     "rating": ["评级", "合格评级", "rating"],
     "gross": ["毛需求", "gross"],
     "onhand": ["可用库存", "现有库存", "onhand"],
-    "in_transit": ["在途", "in_transit"],
+    "in_transit": ["在途", "in_transit", "在制", "在制品", "在途数量"],
     "safety": ["安全库存", "safety"],
     "net": ["净需求", "net"],
     "adjusted_net": ["调整后数量", "调整数量", "adjusted_net"],
@@ -2735,7 +3057,7 @@ COLUMN_ALIASES = {
     "company_code": ["公司编码", "公司", "company_code"],
     "currency": ["币种", "货币", "currency"],
     "exchange_rate": ["汇率", "exchange_rate"],
-    "applicant": ["申请人", "applicant"],
+    "applicant": ["申请人", "applicant", "跟进人", "采购员", "经办人"],
     "reason": ["原因", "申请原因", "reason"],
 }
 
@@ -2833,7 +3155,9 @@ def excel_template(kind: str):
     return _excel_response(rows_to_excel(headers, data, sheet_name="模板"), f"template_{kind}.xlsx")
 
 @app.get("/api/excel/export/{kind}")
-def excel_export(kind: str, sales_order_no: Optional[str] = None):
+def excel_export(kind: str, sales_order_no: Optional[str] = None, x_user: Optional[str] = Header(None)):
+    user = resolve_user(x_user)
+    require_perm(user, "报表", "view")
     conn = get_conn()
     if kind == "parts":
         headers = ["零件编码", "名称", "规格", "单位", "类别", "安全库存", "最低库存", "最高库存", "提前期天数", "未税单价", "税率", "供应商编码"]
@@ -2882,12 +3206,19 @@ def excel_export(kind: str, sales_order_no: Optional[str] = None):
     return _excel_response(rows_to_excel(headers, data, sheet_name=kind), f"export_{kind}.xlsx")
 
 @app.post("/api/excel/import/{kind}")
-async def excel_import(kind: str, file: UploadFile = File(...), sheet: Optional[str] = None):
+async def excel_import(kind: str, file: UploadFile = File(...), sheet: Optional[str] = None, x_user: Optional[str] = Header(None)):
     """
     导入 Excel（灵活映射 + 行号校验）。
     支持 kinds：parts / stock / purchase / bom / supplier / sales / production
     sheet 参数：指定读哪个工作表（如“模拟数据-已填好.xlsx”里有 零件/库存期初/采购/BOM 四页时，导入 BOM 就传 sheet=BOM）。
+    P0-4：按导入数据类型校验模块权限，不再“谁都能导入”。
     """
+    user = resolve_user(x_user)
+    _imp = {"parts": ("零件", "create"), "stock": ("库存", "create"), "purchase": ("采购", "create"),
+            "bom": ("零件", "create"), "supplier": ("供应商", "create"),
+            "sales": ("销售", "create"), "production": ("生产", "create")}
+    _mod, _act = _imp.get(kind, ("系统", "create"))
+    require_perm(user, _mod, _act)
     content = await file.read()
     headers, data_rows = excel_to_rows(content, sheet)
     if not headers:
@@ -2927,9 +3258,25 @@ async def excel_import(kind: str, file: UploadFile = File(...), sheet: Optional[
                 _raw_ip = "" if _raw_ip_v is None else str(_raw_ip_v).strip()
                 is_purchase = 0 if _raw_ip in ("0", "否", "否 ", "N", "n", "No", "no", "自制") else (1 if _raw_ip in ("1", "是", "Y", "y", "Yes", "yes", "外购") else 1)
                 existing = conn.execute("SELECT id FROM parts WHERE code=?", (code,)).fetchone()
+                # P1-3：更新时只改“Excel 里真的有的列”，不再整行覆盖（以前导入一份只含编码/名称/安全库存的表，
+                # 会把单价、税率、提前期、公司全部冲成默认 0/0.13/7/COMP-001）
+                optional_values = {
+                    "spec": str(get(row, "spec", default="")),
+                    "unit": str(get(row, "unit", default="个") or "个"),
+                    "category": str(get(row, "category", default="原材料") or "原材料"),
+                    "is_purchase": is_purchase,
+                    "safety_stock": safety, "min_stock": mins, "max_stock": maxs,
+                    "price": price, "tax_rate": tax, "lead_time_days": lead,
+                    "company_code": comp,
+                }
                 if existing:
-                    conn.execute("UPDATE parts SET name=?,spec=?,unit=?,category=?,is_purchase=?,safety_stock=?,min_stock=?,max_stock=?,price=?,tax_rate=?,lead_time_days=?,company_code=? WHERE code=?",
-                                 (name, str(get(row, "spec", default="")), str(get(row, "unit", default="个") or "个"), str(get(row, "category", default="原材料") or "原材料"), is_purchase, safety, mins, maxs, price, tax, lead, comp, code))
+                    cols = ["name"]; vals: List[Any] = [name]
+                    for f in ("spec", "unit", "category", "is_purchase", "safety_stock", "min_stock",
+                              "max_stock", "price", "tax_rate", "lead_time_days", "company_code"):
+                        if f in mapping:
+                            cols.append(f); vals.append(optional_values[f])
+                    conn.execute("UPDATE parts SET " + ",".join(c + "=?" for c in cols) + " WHERE code=?",
+                                 (*vals, code))
                 else:
                     conn.execute("INSERT INTO parts (code,name,spec,unit,category,is_purchase,safety_stock,min_stock,max_stock,lead_time_days,price,tax_rate,supplier_code,created_at,company_code) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                                  (code, name, str(get(row, "spec", default="")), str(get(row, "unit", default="个") or "个"), str(get(row, "category", default="原材料") or "原材料"), is_purchase, safety, mins, maxs, lead, price, tax, str(get(row, "supplier_code", default="")), now_str(), comp))
@@ -3688,6 +4035,11 @@ def get_report(kind: str, company_code: Optional[str] = None, warehouse: Optiona
     user = resolve_user(x_user)
     require_perm(user, "报表", "view")
     check_scope(user, warehouse=warehouse, company_code=company_code)
+    if kind.endswith(".xlsx"):
+        kind = kind[:-5]
+        headers, data = build_report(kind, {"company_code": company_code or "", "warehouse": warehouse or "",
+                                            "supplier_code": supplier_code or ""})
+        return _excel_response(rows_to_excel(headers, data, sheet_name=kind[:20]), f"report_{kind}.xlsx")
     headers, data = build_report(kind, {"company_code": company_code or "", "warehouse": warehouse or "",
                                         "supplier_code": supplier_code or ""})
     cols = [h for h in headers]
@@ -3704,6 +4056,10 @@ def list_audit_log(user: Optional[str] = None, entity_type: Optional[str] = None
     """审计日志查询（大白话：谁改了什么，都能按人/单据/动作查到；日志只能追加，不能修改删除）。"""
     cur = resolve_user(x_user)
     require_perm(cur, "报表", "view")
+    # P0-4：审计日志只给审计员/系统管理员看（生产员虽然也有“报表 view”，但不该看全公司审计流水）
+    _roles = user_roles_of(get_conn(), cur)
+    if "系统管理员" not in _roles and "审计员" not in _roles:
+        raise HTTPException(403, f"用户 {cur}（角色 {','.join(_roles) or '无'}）没有查看审计日志的权限（仅审计员/系统管理员）")
     conn = get_conn()
     sql = "SELECT * FROM audit_log WHERE 1=1"; args: List[Any] = []
     if user:
@@ -3749,6 +4105,8 @@ def login(payload: Dict[str, Any]):
         raise HTTPException(403, f"用户 {username} 已停用")
     token = secrets.token_urlsafe(32)
     expires = (datetime.now() + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+    # P2-8：每次登录顺手清掉已过期的 Token，避免 auth_tokens 表长期堆积
+    conn.execute("DELETE FROM auth_tokens WHERE expires_at<=?", (now_str(),))
     conn.execute("INSERT INTO auth_tokens (token_hash,username,created_at,expires_at) VALUES (?,?,?,?)",
                  (token_hash(token), username, now_str(), expires))
     conn.commit()

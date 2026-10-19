@@ -6,18 +6,32 @@
 
 ## 怎么跑
 
+### Windows（推荐：双击 `启动PMC系统.bat`）
+
+1. 双击 `phase3\启动PMC系统.bat`：自动建 `.venv`、装依赖、启动服务，3 秒后自动开浏览器。
+2. 浏览器地址 http://127.0.0.1:8000 ，账号 `admin / admin`，首次登录会要求改密码。
+
+### 命令行（Windows / macOS / Linux）
+
+```bat
+:: Windows
+cd /d 你的路径\phase3
+py -3.11 -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe backend\test_phase3.py   :: 自动验证，预期：全部第三阶段验证通过 ✅（共 133 项 ✅）
+.venv\Scripts\python.exe -m uvicorn backend.app:app --host 127.0.0.1 --port 8000
+```
+
 ```bash
+# macOS / Linux
 cd ~/workspace/pmc/phase3
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python backend/test_phase3.py   # 自动验证，预期：全部第三阶段验证通过 ✅（共 133 项 ✅）
-```
-
-启动服务（手动点界面）：
-
-```bash
+.venv/bin/python backend/test_phase3.py
 .venv/bin/uvicorn backend.app:app --reload --port 8000
-# 打开 http://localhost:8000
 ```
+
+- 端口 8000 被占用时换 `--port 8001`（或 8002/8003），浏览器地址跟着改；四个阶段同时在本机跑就分别用 8000/8001/8002/8003，一次只跑一个阶段也可以都占 8000。
+- 详细操作步骤见《怎么用.md》（含模拟表单测试全流程）。
 
 Docker：
 
@@ -101,9 +115,31 @@ https://www.knowledgeerp.com/content/blog/reorder-points.htm（reorder point = a
 
 - `backend/app.py`：后端全部逻辑（FastAPI + SQLite，中文注释 + 大白话解释）
 - `backend/test_phase3.py`：本阶段自动验证脚本（133 项检查）
-- `frontend/index.html`：中文网页界面（登录 + 看板 + 助手 + 补货 + Excel 导入，响应式，手机可用）
+- `frontend/index.html`：中文网页界面（12 个页签：看板 / 零件 / 库存 / 采购 / 生产 / 销售 / MRP / 补货 / 报表 / 审计 / 导入导出 / 助手查询；响应式，手机可用）
+- `backend/test_fixes.py`：本轮修复的回归测试（26 项：锁泄漏、越权、MRP 口径、并发取号、单事务、Excel 部分列导入、报表 xlsx、前端 12 页签等）
 - `模拟表单/`：3 个 Excel 模板 + 1 份已填好模拟数据（见《怎么用.md》）
 - `怎么用.md`：从启动到完整流程的操作指南（中文 + 大白话）
 - `验证报告.md`：验证步骤、结果、参考来源、未做 / 已知限制
 - `requirements.txt` / `Dockerfile` / `docker-compose.yml`
 - `README-MVP.md`：MVP 原 README（参考用）
+
+## 怎么把本地改动同步到 GitHub（P2-2）
+
+本地目录不是 git 仓库时，三种办法任选：
+
+1. **网页上传（最省事，适合少量文件）**：打开 https://github.com/ZZmkk88/pmc-system → 进入对应目录 → `Add file` → `Upload files` → 选文件 → `Commit changes`。
+2. **命令行（推荐，能保留历史）**：
+   ```bat
+   cd /d 你的路径\pmc-system-main
+   git init
+   git add .
+   git commit -m "第三阶段：修复 P0/P1 问题 + 前端做单页面 + 文档"
+   git branch -M main
+   git remote add origin https://github.com/ZZmkk88/pmc-system.git
+   git push -u origin main --force
+   ```
+   （首次 push 会要求登录 GitHub；`--force` 只在确认远端内容可被本地覆盖时用，平时去掉。）
+3. **直接改仓库副本**：先把 `https://github.com/ZZmkk88/pmc-system.git` clone 到本地，在 clone 出来的目录里改，再 `git add/commit/push`。
+
+注意：不要提交 `backend/*.db`、`.venv/`、`__pycache__/`（`.gitignore` 已忽略）。
+
