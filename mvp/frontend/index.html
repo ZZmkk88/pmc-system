@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PMC 系统 MVP - 生产物料控制</title>
+<style>
+body{font-family:PingFang SC,Microsoft YaHei,Arial,sans-serif;margin:0;background:#f5f7fa;color:#222}
+header{background:#1f4e79;color:#fff;padding:16px 24px}
+header h1{margin:0;font-size:20px} header p{margin:4px 0 0;opacity:.85;font-size:13px}
+nav{display:flex;gap:8px;padding:12px 24px;background:#fff;border-bottom:1px solid #e5e5e5;flex-wrap:wrap}
+nav button{padding:8px 14px;border:1px solid #1f4e79;background:#fff;color:#1f4e79;border-radius:6px;cursor:pointer}
+nav button.active{background:#1f4e79;color:#fff}
+main{padding:16px 24px;max-width:1100px;margin:0 auto}
+.card{background:#fff;border-radius:8px;padding:16px;margin-bottom:16px;box-shadow:0 1px 4px rgba(0,0,0,.06)}
+table{width:100%;border-collapse:collapse;font-size:14px} th,td{border:1px solid #eee;padding:8px;text-align:left} th{background:#f0f4f8}
+input,select{padding:7px 9px;border:1px solid #ccc;border-radius:6px;margin:4px 4px 4px 0}
+.btn{padding:8px 14px;background:#1f4e79;color:#fff;border:none;border-radius:6px;cursor:pointer}
+.btn2{padding:8px 14px;background:#e67e22;color:#fff;border:none;border-radius:6px;cursor:pointer}
+.red{color:#d33;font-weight:bold} .green{color:#1a8a4a} .yellow{color:#b77900}
+pre{background:#f7f7f7;padding:12px;border-radius:6px;overflow:auto;font-size:13px}
+.small{font-size:12px;color:#666}
+</style>
+</head>
+<body>
+<header><h1>PMC 系统 MVP</h1><p>生产物料控制（大白话：管缺啥料、买多少、什么时候买）| 演示：LED 小夜灯 | 中文界面 | 支持 Excel / WPS 导入导出</p></header>
+<nav>
+<button class="active" onclick="show('dash',this)">看板</button>
+<button onclick="show('parts',this)">零件</button>
+<button onclick="show('bom',this)">BOM</button>
+<button onclick="show('stock',this)">库存</button>
+<button onclick="show('sales',this)">销售单</button>
+<button onclick="show('mrp',this)">MRP</button>
+<button onclick="show('purchase',this)">采购</button>
+<button onclick="show('prod',this)">生产</button>
+<button onclick="show('excel',this)">Excel 导入导出</button>
+</nav>
+<main>
+<div id="dash" class="card"><h3>看板（大白话：一张表看到缺啥、拖期、预警）</h3><div id="dashBody">加载中…</div><button class="btn" onclick="loadDash()">刷新看板</button></div>
+
+<div id="parts" class="card" style="display:none"><h3>零件管理</h3><div id="partsBody"></div></div>
+<div id="bom" class="card" style="display:none"><h3>BOM（物料清单，大白话：配方表）- 小夜灯 FG-001</h3><div id="bomBody"></div>
+<p>爆炸测试：做 <input id="explodeQty" value="100" style="width:70px"> 个小夜灯 <button class="btn" onclick="explode()">BOM爆炸</button></p><pre id="explodeOut"></pre></div>
+<div id="stock" class="card" style="display:none"><h3>库存</h3><div id="stockBody"></div></div>
+
+<div id="sales" class="card" style="display:none"><h3>销售单（大白话：客户要多少成品）</h3>
+<input id="soNo" placeholder="销售单号 如 SO-001" value="SO-001"><input id="soQty" value="100" placeholder="数量"><input id="soCust" placeholder="客户" value="演示客户"><button class="btn" onclick="createSales()">创建销售单 100个小夜灯</button><div id="salesBody"></div></div>
+
+<div id="mrp" class="card" style="display:none"><h3>MRP（物料需求计划，大白话：自动算缺啥）</h3>
+<p>公式：净需求 = 毛需求 - 可用库存 - 在途 + 安全库存</p>
+<input id="mrpSo" placeholder="销售单号" value="SO-001"><button class="btn2" onclick="runMrp()">运行 MRP</button>
+<button class="btn" onclick="loadMrp()">查看 MRP 结果</button><div id="mrpBody"></div>
+<button class="btn" onclick="poFromMrp()">从 MRP 一键生成采购单</button><div id="poFromMrpOut"></div></div>
+
+<div id="purchase" class="card" style="display:none"><h3>采购单</h3><div id="poBody"></div>
+<p>到货入库：采购单号 <input id="recvPo" placeholder="PO-..."><input id="recvPart" placeholder="零件编码 RM-001"><input id="recvQty" value="80" placeholder="到货数量"><button class="btn" onclick="receive()">确认到货入库</button></p><div id="recvOut"></div></div>
+
+<div id="prod" class="card" style="display:none"><h3>生产单</h3>
+<input id="moNo" placeholder="生产单号" value="MO-001"><input id="moQty" value="100"><button class="btn" onclick="createMo()">创建生产单</button>
+<button class="btn2" onclick="consume()">领料（扣库存）</button><button class="btn" onclick="complete()">完工入库（成品+100）</button><div id="moBody"></div></div>
+
+<div id="excel" class="card" style="display:none"><h3>Excel / WPS 导入导出（大白话：和公司表格互相倒数据）</h3>
+<p class="small">支持灵活映射：不同公司叫法不同（物料编码 / 材料编码 / 料号 / 零件编码）都能映射到零件编码。WPS / Excel 都用 .xlsx 通用格式。</p>
+<p><b>导出：</b><button class="btn" onclick="dl('/api/excel/export/parts')">导出零件 Excel</button><button class="btn" onclick="dl('/api/excel/export/stock')">导出库存 Excel</button><button class="btn" onclick="dl('/api/excel/export/purchase')">导出采购 Excel</button></p>
+<p><b>模板：</b><button class="btn" onclick="dl('/api/excel/template/parts')">下载零件模板</button><button class="btn" onclick="dl('/api/excel/template/stock')">下载库存模板</button><button class="btn" onclick="dl('/api/excel/template/purchase')">下载采购模板</button></p>
+<p><b>导入：</b><select id="impKind"><option value="parts">零件</option><option value="stock">库存</option><option value="purchase">采购</option></select><input type="file" id="impFile" accept=".xlsx"><button class="btn2" onclick="doImport()">上传导入</button></p><pre id="impOut"></pre></div>
+</main>
+<script>
+function show(id,btn){document.querySelectorAll('main .card').forEach(e=>e.style.display='none');document.getElementById(id).style.display='block';document.querySelectorAll('nav button').forEach(b=>b.classList.remove('active'));btn.classList.add('active');if(id=='dash')loadDash();if(id=='parts')loadParts();if(id=='bom')loadBom();if(id=='stock')loadStock();if(id=='sales')loadSales();if(id=='purchase')loadPo();if(id=='prod')loadMo();}
+async function j(u,o){let r=await fetch(u,o);let t=await r.text();try{return JSON.parse(t)}catch(e){return {error:t, status:r.status}}}
+function tbl(headers,rows){let h='<table><tr>'+headers.map(x=>`<th>${x}</th>`).join('')+'</tr>';for(let r of rows){h+='<tr>'+r.map(x=>`<td>${x??''}</td>`).join('')+'</tr>';}return h+'</table>';}
+async function loadDash(){let d=await j('/api/dashboard');document.getElementById('dashBody').innerHTML=`<p>缺料预警（库存 &lt; 安全库存）：${d.low_stock.map(x=>`${x.code} ${x.name} 现有${x.onhand} 安全${x.safety_stock}`).join('； ')||'暂无'}</p><p>待跟进采购单：${d.pending_purchase.length} 张</p><p>库存记录数：${d.stock_count}</p>`;}
+async function loadParts(){let d=await j('/api/parts');document.getElementById('partsBody').innerHTML=tbl(['编码','名称','类别','安全库存','单价','税率'],d.map(x=>[x.code,x.name,x.category,x.safety_stock,x.price,x.tax_rate]));}
+async function loadBom(){let d=await j('/api/bom/FG-001');document.getElementById('bomBody').innerHTML=tbl(['父件','子件','子件名','用量'],d.map(x=>[x.parent_code,x.child_code,x.child_name,x.qty]));}
+async function loadStock(){let d=await j('/api/stock');document.getElementById('stockBody').innerHTML=tbl(['零件','名称','仓库','库位','批次','数量','安全库存'],d.map(x=>[x.part_code,x.part_name,x.warehouse,x.location,x.batch,x.qty,x.safety_stock]));}
+async function loadSales(){let d=await j('/api/sales');document.getElementById('salesBody').innerHTML=tbl(['单号','客户','产品','数量','状态'],d.map(x=>[x.order_no,x.customer,x.product_code,x.qty,x.status]));}
+async function loadMrp(){let so=document.getElementById('mrpSo').value;let d=await j('/api/mrp/'+so);document.getElementById('mrpBody').innerHTML=tbl(['零件','名称','毛需求','库存','在途','安全','净需求（缺多少）'],d.map(x=>[x.part_code,x.part_name,x.gross,x.onhand,x.in_transit,x.safety,x.net]));}
+async function loadPo(){let d=await j('/api/purchase');let html='';for(let po of d){html+=`<p><b>${po.order_no}</b> 供应商${po.supplier_code} 状态${po.status} 含税总额${po.total_amount}</p>`+tbl(['零件','数量','单价','已到货'],po.items.map(x=>[x.part_code,x.qty,x.price,x.received_qty]));}document.getElementById('poBody').innerHTML=html||'暂无采购单';}
+async function loadMo(){let d=await j('/api/production');document.getElementById('moBody').innerHTML=tbl(['单号','产品','数量','状态'],d.map(x=>[x.order_no,x.product_code,x.qty,x.status]));}
+async function explode(){let q=document.getElementById('explodeQty').value;let d=await j('/api/bom/explode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({parent_code:'FG-001',qty:parseFloat(q)})});document.getElementById('explodeOut').textContent=JSON.stringify(d,null,2);}
+async function createSales(){let d=await j('/api/sales',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({order_no:document.getElementById('soNo').value,customer:document.getElementById('soCust').value,product_code:'FG-001',qty:parseFloat(document.getElementById('soQty').value)})});alert(JSON.stringify(d));loadSales();}
+async function runMrp(){let d=await j('/api/mrp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sales_order_no:document.getElementById('mrpSo').value})});document.getElementById('mrpBody').innerHTML='<pre>'+JSON.stringify(d,null,2)+'</pre>';}
+async function poFromMrp(){let d=await j('/api/purchase/from-mrp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sales_order_no:document.getElementById('mrpSo').value})});document.getElementById('poFromMrpOut').innerHTML='<pre>'+JSON.stringify(d,null,2)+'</pre>';loadPo();}
+async function receive(){let d=await j('/api/purchase/receive',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({order_no:document.getElementById('recvPo').value,part_code:document.getElementById('recvPart').value,qty:parseFloat(document.getElementById('recvQty').value)})});document.getElementById('recvOut').innerHTML='<pre>'+JSON.stringify(d,null,2)+'</pre>';loadPo();loadStock();}
+async function createMo(){let d=await j('/api/production',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({order_no:document.getElementById('moNo').value,product_code:'FG-001',qty:parseFloat(document.getElementById('moQty').value),sales_order_no:'SO-001'})});alert(JSON.stringify(d));loadMo();}
+async function consume(){let d=await j('/api/production/consume',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({order_no:document.getElementById('moNo').value})});alert(JSON.stringify(d));loadMo();loadStock();}
+async function complete(){let d=await j('/api/production/complete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({order_no:document.getElementById('moNo').value})});alert(JSON.stringify(d));loadMo();loadStock();}
+function dl(u){window.open(u,'_blank');}
+async function doImport(){let kind=document.getElementById('impKind').value;let f=document.getElementById('impFile').files[0];if(!f){alert('请先选文件');return;}let fd=new FormData();fd.append('file',f);let r=await fetch('/api/excel/import/'+kind,{method:'POST',body:fd});let d=await r.json();document.getElementById('impOut').textContent=JSON.stringify(d,null,2);}
+loadDash();
+</script>
+</body>
+</html>

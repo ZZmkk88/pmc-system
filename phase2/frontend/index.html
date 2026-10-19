@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>PMC 系统 第二阶段</title>
+<style>body{font-family:PingFang SC,Microsoft YaHei,sans-serif;margin:24px}h1{font-size:22px}
+.card{border:1px solid #ddd;border-radius:8px;padding:12px;margin:10px 0}.红{color:#fff;background:#d9534f;padding:2px 8px;border-radius:10px}
+.黄{color:#fff;background:#f0ad4e;padding:2px 8px;border-radius:10px}.绿{color:#fff;background:#5cb85c;padding:2px 8px;border-radius:10px}
+button{margin:4px;padding:6px 12px}pre{background:#f6f6f6;padding:10px;white-space:pre-wrap}</style></head>
+<body><h1>PMC 系统 第二阶段（生产物料控制）</h1>
+<p>大白话：管“缺啥料、买多少、什么时候买”。第二阶段：多公司 / 多仓库 / 多币种 + 金额分级审批 + 财务对账 + RBAC 权限 + 报表 + 审计日志；税率默认 13%。</p>
+<p>当前用户（演示用，请求头 X-User）：<input id="user" value="admin" style="width:120px"> <small>试试 keeper（只限主仓）、auditor（只读）、buyer（无审批权）</small></p>
+<div id="dash"></div>
+<h2>快捷操作</h2>
+<button onclick="show('/api/companies')">公司</button>
+<button onclick="show('/api/warehouses')">仓库</button>
+<button onclick="show('/api/currencies')">币种</button>
+<button onclick="show('/api/exchange-rates')">汇率</button>
+<button onclick="show('/api/parts')">零件列表</button>
+<button onclick="show('/api/stock/available')">可用量总览</button>
+<button onclick="show('/api/stock/frozen')">冻结明细</button>
+<button onclick="show('/api/purchase')">采购单</button>
+<button onclick="show('/api/production')">生产单</button>
+<button onclick="show('/api/sales')">销售单</button>
+<button onclick="show('/api/approvals')">审批记录</button>
+<button onclick="show('/api/approvals/pending')">我的待审批</button>
+<button onclick="show('/api/finance/invoices')">供应商发票</button>
+<button onclick="show('/api/finance/payables')">应付报表</button>
+<button onclick="show('/api/reports/stock_balance')">报表：库存结存</button>
+<button onclick="show('/api/reports/purchase_summary')">报表：采购汇总</button>
+<button onclick="show('/api/reports/production_summary')">报表：生产汇总</button>
+<button onclick="show('/api/audit-log?limit=50')">审计日志</button>
+<button onclick="show('/api/users')">用户</button>
+<pre id="out">点按钮查看数据（JSON 格式）。</pre>
+<script>
+function user(){return document.getElementById('user').value || 'admin';}
+async function loadDash(){
+  const r=await fetch('/api/dashboard',{headers:{'X-User':user()}}); const d=await r.json();
+  let html='<h2>看板（红=有问题，黄=预警，绿=正常）</h2>';
+  for(const k of ['shortage','overdue_purchase','supplier_ranking','production_shortage']){
+    const b=d[k]; html+=`<div class="card"><b>${b.title}</b> <span class="${b.status}">${b.status}</span> 数量：${b.count}<br><small>${JSON.stringify(b.items).slice(0,600)}</small></div>`;
+  }
+  document.getElementById('dash').innerHTML=html;
+}
+async function show(url){ const r=await fetch(url,{headers:{'X-User':user()}}); document.getElementById('out').textContent=url+'\n'+JSON.stringify(await r.json(),null,2).slice(0,6000); }
+loadDash();
+</script></body></html>

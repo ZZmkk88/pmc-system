@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>PMC 系统 第一阶段</title>
+<style>body{font-family:PingFang SC,Microsoft YaHei,sans-serif;margin:24px}h1{font-size:22px}
+.card{border:1px solid #ddd;border-radius:8px;padding:12px;margin:10px 0}.红{color:#fff;background:#d9534f;padding:2px 8px;border-radius:10px}
+.黄{color:#fff;background:#f0ad4e;padding:2px 8px;border-radius:10px}.绿{color:#fff;background:#5cb85c;padding:2px 8px;border-radius:10px}
+button{margin:4px;padding:6px 12px}pre{background:#f6f6f6;padding:10px;white-space:pre-wrap}</style></head>
+<body><h1>PMC 系统 第一阶段（生产物料控制）</h1>
+<p>大白话：管“缺啥料、买多少、什么时候买”。单仓库、单公司、单币种，税率默认 13%。</p>
+<div id="dash"></div>
+<h2>快捷操作</h2>
+<button onclick="show('/api/parts')">零件列表</button>
+<button onclick="show('/api/stock/available')">可用量总览</button>
+<button onclick="show('/api/purchase')">采购单</button>
+<button onclick="show('/api/production')">生产单</button>
+<button onclick="show('/api/sales')">销售单</button>
+<button onclick="show('/api/supplier-parts')">供应商价格表</button>
+<pre id="out">点按钮查看数据（JSON 格式）。</pre>
+<script>
+async function loadDash(){
+  const r=await fetch('/api/dashboard'); const d=await r.json();
+  let html='<h2>看板（红=有问题，黄=预警，绿=正常）</h2>';
+  for(const k of ['shortage','overdue_purchase','supplier_ranking','production_shortage']){
+    const b=d[k]; html+=`<div class="card"><b>${b.title}</b> <span class="${b.status}">${b.status}</span> 数量：${b.count}<br><small>${JSON.stringify(b.items).slice(0,600)}</small></div>`;
+  }
+  document.getElementById('dash').innerHTML=html;
+}
+async function show(url){ const r=await fetch(url); document.getElementById('out').textContent=url+'\n'+JSON.stringify(await r.json(),null,2).slice(0,6000); }
+loadDash();
+</script></body></html>
