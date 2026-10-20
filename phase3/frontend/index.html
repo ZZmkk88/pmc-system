@@ -205,12 +205,13 @@ const DASH_LABELS = {part_code:'编码', part_name:'名称', unit:'单位', avai
   recommended_supplier:'推荐供应商', supplier_code:'供应商', order_no:'单号', po_no:'采购单',
   due_date:'交期', delay_days:'拖期(天)', days_late:'拖期(天)', overdue_days:'拖期(天)',
   product_code:'产品', mo_no:'生产单', order_qty:'订单数量', qty:'数量', shortage_qty:'缺口',
-  supplier_name:'供应商名称', delay_count:'拖期次数', score:'评分'};
+  supplier_name:'供应商名称', delay_count:'拖期次数', score:'评分',
+  kitting_rate:'到齐率(%)', ready_items:'到齐项数', total_items:'总项数', dept:'领用部门', purpose:'用途'};
 async function pageDashboard(){
   try{
     const d = await api('/api/dashboard');
     let h = '';
-    const blocks = [d.replenishment, d.shortage, d.overdue_purchase, d.supplier_ranking, d.production_shortage];
+    const blocks = [d.replenishment, d.shortage, d.overdue_purchase, d.supplier_ranking, d.production_shortage, d.kitting];
     for(const b of blocks){
       if(!b) continue;
       const cls = b.status==='红'?'b-red':(b.status==='黄'?'b-yellow':'b-green');
@@ -381,7 +382,10 @@ async function submitMo(id){
   }catch(e){ msg('创建失败：'+e.message,false); }
 }
 async function consumeMo(no){
-  try{ const d = await api('/api/production/consume',{method:'POST',body:{order_no:no}});
+  // P2-6：领用部门/用途选填，直接回车跳过
+  const dept = (prompt('领用部门（选填，直接回车跳过）','') || '').trim();
+  const purpose = (prompt('用途（选填，直接回车跳过）','') || '').trim();
+  try{ const d = await api('/api/production/consume',{method:'POST',body:{order_no:no, dept:dept, purpose:purpose}});
     msg('领料成功，共 '+((d.consumed||[]).length)+' 条',true); pageProduction(); }
   catch(e){ msg('领料失败：'+e.message,false); }
 }
@@ -517,6 +521,9 @@ async function pageData(){
   }).join('')+'</div><div id="imp-msg" class="msg"></div>');
   h += card('Excel 模板下载', '<div class="row">'+kinds.map(function(x){ return '<button onclick="downloadTemplate(\''+x[0]+'\')">'+x[1]+'模板</button>'; }).join('')+'</div>');
   h += card('Excel 全量导出', '<div class="row">'+kinds.map(function(x){ return '<button onclick="exportData(\''+x[0]+'\')">导出'+x[1]+'</button>'; }).join('')+'</div>');
+  h += card('出入库表导出（P2-5：入库/出库流水，含库位/经办人/单价）',
+    '<div class="row"><button onclick="exportData(\'stock_in\')">导出入库表</button><button onclick="exportData(\'stock_out\')">导出出库表</button></div>' +
+    '<p class="muted">表头：单号、日期、类型、仓库、库位、零件编码、零件名称、规格型号、批次、数量、单价、金额、经办人、关联单号、备注</p>');
   $('view').innerHTML = '<div id="view-msg" class="msg"></div>' + h;
 }
 async function importExcel(kind){

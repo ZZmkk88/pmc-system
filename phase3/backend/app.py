@@ -505,6 +505,13 @@ def init_db():
         # 第三阶段：用户表补密码哈希列（老库升级用；新库建表时已含则跳过）
         ("users", "password_hash", "TEXT DEFAULT ''"),
         ("users", "password_changed", "INTEGER DEFAULT 0"),
+        # 第四轮迭代：仓库默认库位（P1-5）+ 流水补库位/经办人/单价（P2-5）+ 领料部门/用途（P2-6）
+        ("warehouses", "default_location", "TEXT DEFAULT 'A区-01'"),
+        ("stock_ledger", "location", "TEXT DEFAULT ''"),
+        ("stock_ledger", "operator", "TEXT DEFAULT ''"),
+        ("stock_ledger", "unit_price", "REAL DEFAULT 0"),
+        ("production_consumptions", "dept", "TEXT DEFAULT ''"),
+        ("production_consumptions", "purpose", "TEXT DEFAULT ''"),
     ]:
         try:
             ensure_column(conn, _tbl, _col, _ddl)
@@ -556,9 +563,9 @@ def init_db():
         CREATE TABLE IF NOT EXISTS stock_ledger (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             part_code TEXT NOT NULL, warehouse TEXT DEFAULT '主仓',
-            batch TEXT DEFAULT '', change_qty REAL NOT NULL,
-            type TEXT NOT NULL, ref_no TEXT DEFAULT '',
-            remark TEXT DEFAULT '', created_at TEXT DEFAULT ''
+            location TEXT DEFAULT '', batch TEXT DEFAULT '', change_qty REAL NOT NULL,
+            type TEXT NOT NULL, ref_no TEXT DEFAULT '', operator TEXT DEFAULT '',
+            unit_price REAL DEFAULT 0, remark TEXT DEFAULT '', created_at TEXT DEFAULT ''
         )
     """)
     # 冻结表：被质检/盘点等原因冻住的量（大白话：货在仓库，但暂时不能用）
@@ -667,7 +674,7 @@ def init_db():
     cur.execute("""CREATE TABLE IF NOT EXISTS warehouses (
         id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
         company_code TEXT DEFAULT 'COMP-001', type TEXT DEFAULT '综合', address TEXT DEFAULT '',
-        created_at TEXT DEFAULT '')""")
+        default_location TEXT DEFAULT 'A区-01', created_at TEXT DEFAULT '')""")
     cur.execute("""CREATE TABLE IF NOT EXISTS currencies (
         id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
         symbol TEXT DEFAULT '', created_at TEXT DEFAULT '')""")
@@ -728,7 +735,7 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT, order_no TEXT NOT NULL, part_code TEXT NOT NULL,
         qty REAL DEFAULT 0, unit_cost REAL DEFAULT 0, total_cost REAL DEFAULT 0,
         batch TEXT DEFAULT '', warehouse TEXT DEFAULT '主仓', company_code TEXT DEFAULT 'COMP-001',
-        created_at TEXT DEFAULT '')""")
+        dept TEXT DEFAULT '', purpose TEXT DEFAULT '', created_at TEXT DEFAULT '')""")
     # 第二阶段：建表后再补列（保证老表也有新列；新表建表语句已含新列则跳过）
     for _tbl, _col, _ddl in [
         ("parts", "company_code", "TEXT DEFAULT 'COMP-001'"),
@@ -834,10 +841,16 @@ def init_db():
         for code, name, cur_, country in [("COMP-001", "深圳总公司", "CNY", "中国"), ("COMP-002", "上海分公司", "CNY", "中国")]:
             cur.execute("INSERT OR IGNORE INTO companies (code,name,base_currency,country,tax_rate,created_at) VALUES (?,?,?,?,?,?)",
                         (code, name, cur_, country, 0.13, now))
-        for code, name, comp, typ in [("主仓", "主仓", "COMP-001", "综合"), ("分仓", "分仓", "COMP-001", "原材料"),
-                                      ("成品仓", "成品仓", "COMP-001", "成品"), ("上海仓", "上海仓", "COMP-002", "综合")]:
-            cur.execute("INSERT OR IGNORE INTO warehouses (code,name,company_code,type,created_at) VALUES (?,?,?,?,?)",
-                        (code, name, comp, typ, now))
+        for code, name, comp, typ, dloc in [("主仓", "主仓", "COMP-001", "综合", "A区-01"),
+                                               ("分仓", "分仓", "COMP-001", "原材料", "B区-01"),
+                                               ("成品仓", "成品仓", "COMP-001", "成品", "C区-01"),
+                                               ("上海仓", "上海仓", "COMP-002", "综合", "D区-01")]:
+            cur.execute("INSERT OR IGNORE INTO warehouses (code,name,company_code,type,default_location,created_at) VALUES (?,?,?,?,?,?)",
+                        (code, name, comp, typ, dloc, now))
+        # P1-5：老库升级时给已存在的仓库补上合理的默认库位（只补还没改过的，避免覆盖用户手工配置）
+        for _wcode, _wloc in [("主仓", "A区-01"), ("分仓", "B区-01"), ("成品仓", "C区-01"), ("上海仓", "D区-01")]:
+            cur.execute("UPDATE warehouses SET default_location=? WHERE code=? AND (default_location IS NULL OR default_location='' OR default_location='A区-01')",
+                        (_wloc, _wcode))
         for code, name, sym in [("CNY", "人民币", "¥"), ("USD", "美元", "$"), ("EUR", "欧元", "€"), ("HKD", "港币", "HK$")]:
             cur.execute("INSERT OR IGNORE INTO currencies (code,name,symbol,created_at) VALUES (?,?,?,?)", (code, name, sym, now))
         for f, t, rate in [("USD", "CNY", 7.20), ("EUR", "CNY", 7.80), ("HKD", "CNY", 0.92), ("CNY", "CNY", 1.0)]:
@@ -992,21 +1005,38 @@ def stock_status(available: float, safety: float, max_stock: float) -> str:
         return "黄"
     return "绿"
 
-# 默认库位/批次（大白话：以前写死 A区-01 / BATCH-20261019，现在可以用环境变量覆盖；
-# 入库/到货/领料也允许显式传批次，见各接口。彻底改成“仓库主数据”留到下一阶段，见修复报告未修项）
+# 兜底库位/批次（大白话：正常情况不再直接用这两个值，库位先去仓库主数据查、批次按当天日期生成；
+# 只有仓库不在主数据里时才用这里的环境变量兜底，见 warehouse_default_location / today_batch）
 DEFAULT_LOCATION = os.environ.get("PMC_DEFAULT_LOCATION", "A区-01")
 DEFAULT_BATCH = os.environ.get("PMC_DEFAULT_BATCH", "BATCH-20261019")
 
-def add_ledger(part_code, qty_change, typ, ref_no, remark="", warehouse="主仓", batch=None, company_code=None, conn=None):
-    """记库存流水（大白话：库存每动一次就写一条账）。传了 conn 就复用同一个事务，不再自己提交。"""
+def warehouse_default_location(conn, warehouse: str) -> str:
+    """取仓库的默认库位（大白话：这个仓库平时把货放哪个库位，在仓库主数据里配，P1-5 用户选 A 方案）。
+    仓库不在主数据里或没配默认库位时，才用环境变量 PMC_DEFAULT_LOCATION 兜底。"""
+    try:
+        row = conn.execute("SELECT default_location FROM warehouses WHERE code=?", (warehouse,)).fetchone()
+        if row and row["default_location"]:
+            return str(row["default_location"])
+    except Exception:
+        pass
+    return DEFAULT_LOCATION
+
+def today_batch() -> str:
+    """当天日期生成的批次号（大白话：入库不填批次时用今天日期，比如 BATCH-20261020，不再写死 BATCH-20261019，P1-5 用户选 A 方案）。"""
+    return "BATCH-" + date.today().strftime("%Y%m%d")
+
+def add_ledger(part_code, qty_change, typ, ref_no, remark="", warehouse="主仓", batch=None, company_code=None, conn=None,
+               location=None, operator="", unit_price=0.0):
+    """记库存流水（大白话：库存每动一次就写一条账）。传了 conn 就复用同一个事务，不再自己提交。
+    P2-5：流水补记 库位/经办人/单价，出库入库表导出就靠这三列；不填批次时按当天日期生成（P1-5）。"""
     own = conn is None
     if own:
         conn = get_conn()
     try:
         if company_code is None:
             company_code = warehouse_company(conn, warehouse)
-        conn.execute("INSERT INTO stock_ledger (part_code,warehouse,batch,change_qty,type,ref_no,remark,created_at,company_code) VALUES (?,?,?,?,?,?,?,?,?)",
-                     (part_code, warehouse, batch or DEFAULT_BATCH, qty_change, typ, ref_no, remark, now_str(), company_code))
+        conn.execute("INSERT INTO stock_ledger (part_code,warehouse,location,batch,change_qty,type,ref_no,operator,unit_price,remark,created_at,company_code) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                     (part_code, warehouse, location or "", batch or today_batch(), qty_change, typ, ref_no, operator or "", float(unit_price or 0), remark, now_str(), company_code))
         if own:
             conn.commit()
     except Exception:
@@ -1020,13 +1050,16 @@ def add_ledger(part_code, qty_change, typ, ref_no, remark="", warehouse="主仓"
         if own:
             conn.close()
 
-def adjust_stock(part_code, delta, typ, ref_no, warehouse="主仓", location=None, batch=None, company_code=None, conn=None):
-    """调库存（大白话：入库就加，出库就减），库存变更和流水写在同一个事务里（P1-6：不再“库存变了却没流水”）"""
+def adjust_stock(part_code, delta, typ, ref_no, warehouse="主仓", location=None, batch=None, company_code=None, conn=None,
+                 operator="", unit_price=0.0):
+    """调库存（大白话：入库就加，出库就减），库存变更和流水写在同一个事务里（P1-6：不再“库存变了却没流水”）。
+    P1-5：不填库位就用该仓库的默认库位（仓库主数据），不填批次就按当天日期生成批次；不再写死 A区-01 / BATCH-20261019。
+    P2-5：流水里记下经办人、单价（单价=含税口径按零件档案算），给入库/出库表导出用。"""
     own = conn is None
     if own:
         conn = get_conn()
-    location = location or DEFAULT_LOCATION
-    batch = batch or DEFAULT_BATCH
+    location = location or warehouse_default_location(conn, warehouse)
+    batch = batch or today_batch()
     try:
         if company_code is None:
             company_code = warehouse_company(conn, warehouse)
@@ -1035,8 +1068,8 @@ def adjust_stock(part_code, delta, typ, ref_no, warehouse="主仓", location=Non
             conn.execute("UPDATE stock SET qty=qty+? WHERE id=?", (delta, row["id"]))
         else:
             conn.execute("INSERT INTO stock (part_code,warehouse,location,batch,qty,company_code) VALUES (?,?,?,?,?,?)", (part_code, warehouse, location, batch, delta, company_code))
-        conn.execute("INSERT INTO stock_ledger (part_code,warehouse,batch,change_qty,type,ref_no,remark,created_at,company_code) VALUES (?,?,?,?,?,?,?,?,?)",
-                     (part_code, warehouse, batch, delta, typ, ref_no, f"{typ} {delta}", now_str(), company_code))
+        conn.execute("INSERT INTO stock_ledger (part_code,warehouse,location,batch,change_qty,type,ref_no,operator,unit_price,remark,created_at,company_code) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                     (part_code, warehouse, location, batch, delta, typ, ref_no, operator or "", float(unit_price or 0), f"{typ} {delta}", now_str(), company_code))
         if own:
             conn.commit()
     except Exception:
@@ -1725,35 +1758,60 @@ def stock_in(payload: Dict[str, Any], x_user: Optional[str] = Header(None)):
     check_scope(user, warehouse=warehouse)
     if not code:
         raise HTTPException(400, "零件编码必填")
+    # P1-5：库位/批次不填就用仓库默认库位+当天日期批次（adjust_stock 里按仓库主数据兜底）
     adjust_stock(code, qty, payload.get("type", "其他入库"), payload.get("ref_no", "手动入库"),
-                 warehouse, payload.get("location") or DEFAULT_LOCATION, payload.get("batch") or DEFAULT_BATCH)
+                 warehouse, payload.get("location"), payload.get("batch"), operator=user)
     log_audit(user, "入库", "库存", code, "数量", "", f"+{qty}@{warehouse}", payload.get("ref_no", "手动入库"))
     return {"ok": True, "part_code": code, "qty": qty, "onhand": get_onhand(code, warehouse)}
 
 @app.post("/api/stock/out")
 def stock_out(payload: Dict[str, Any], x_user: Optional[str] = Header(None)):
-    """出库（大白话：货出仓库，库存减少）。出库前检查该批次可用库存（现有-该批次冻结）够不够。"""
+    """出库（大白话：货出仓库，库存减少）。
+    指定批次：出库前检查该批次可用库存（现有-该批次冻结）够不够；
+    不指定批次：按批次 FIFO（先进先出）扣，和生产领料一个逻辑，不再写死从 BATCH-20261019 扣。"""
     user = resolve_user(x_user)
     require_perm(user, "库存", "edit")
     code = payload.get("part_code", ""); qty = num_field(payload.get("qty"), "数量", required=True, positive=True)
-    warehouse = payload.get("warehouse", "主仓"); batch = payload.get("batch") or DEFAULT_BATCH
+    warehouse = payload.get("warehouse", "主仓")
+    location = payload.get("location")
+    batch = payload.get("batch")
     check_scope(user, warehouse=warehouse)
     if not code:
         raise HTTPException(400, "零件编码必填")
     conn = get_conn()
     try:
-        batch_avail = get_batch_available(conn, code, warehouse, batch)
-        if batch_avail + 1e-9 < qty:
-            raise HTTPException(400, f"零件 {code} 批次 {batch} 可用量不足：需要 {qty}，该批次可用 {batch_avail}（现有-该批次冻结）")
-        adjust_stock(code, -qty, payload.get("type", "其他出库"), payload.get("ref_no", "手动出库"),
-                     warehouse, payload.get("location") or DEFAULT_LOCATION, batch, conn=conn)
+        loc = location or warehouse_default_location(conn, warehouse)
+        if batch:
+            batch_avail = get_batch_available(conn, code, warehouse, batch)
+            if batch_avail + 1e-9 < qty:
+                raise HTTPException(400, f"零件 {code} 批次 {batch} 可用量不足：需要 {qty}，该批次可用 {batch_avail}（现有-该批次冻结）")
+            adjust_stock(code, -qty, payload.get("type", "其他出库"), payload.get("ref_no", "手动出库"),
+                         warehouse, loc, batch, conn=conn, operator=user)
+        else:
+            # 未指定批次：按批次 FIFO 逐个扣，跳过被冻结的批次量
+            comp = warehouse_company(conn, warehouse)
+            rows = conn.execute("SELECT * FROM stock WHERE part_code=? AND warehouse=? AND location=? AND company_code=? AND qty>0 ORDER BY batch ASC",
+                                (code, warehouse, loc, comp)).fetchall()
+            remain = qty
+            for row in rows:
+                if remain <= 1e-9:
+                    break
+                take_avail = float(row["qty"]) - get_batch_frozen(conn, code, warehouse, row["batch"], comp)
+                take = min(take_avail, remain)
+                if take <= 1e-9:
+                    continue
+                adjust_stock(code, -take, payload.get("type", "其他出库"), payload.get("ref_no", "手动出库"),
+                             warehouse, loc, row["batch"], comp, conn=conn, operator=user)
+                remain -= take
+            if remain > 1e-9:
+                raise HTTPException(400, f"零件 {code} 仓库 {warehouse}/{loc} 可用量不足：需要 {qty}，只够 {round(qty - remain, 4)}")
         conn.commit()
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
-    log_audit(user, "出库", "库存", code, "数量", "", f"-{qty}@{warehouse}/{batch}", payload.get("ref_no", "手动出库"))
+    log_audit(user, "出库", "库存", code, "数量", "", f"-{qty}@{warehouse}/{batch or 'FIFO'}", payload.get("ref_no", "手动出库"))
     return {"ok": True, "part_code": code, "qty": qty, "onhand": get_onhand(code, warehouse)}
 
 @app.post("/api/stock/transfer")
@@ -1763,17 +1821,27 @@ def stock_transfer(payload: Dict[str, Any], x_user: Optional[str] = Header(None)
     user = resolve_user(x_user)
     require_perm(user, "库存", "edit")
     code = payload.get("part_code", ""); qty = num_field(payload.get("qty"), "数量", required=True, positive=True)
-    from_loc = payload.get("from_location") or DEFAULT_LOCATION; to_loc = payload.get("to_location", "B区-01")
-    from_batch = payload.get("from_batch") or DEFAULT_BATCH; to_batch = payload.get("to_batch", from_batch)
     from_wh = payload.get("from_warehouse") or payload.get("warehouse", "主仓")
     to_wh = payload.get("to_warehouse") or payload.get("warehouse", "主仓")
     check_scope(user, warehouse=from_wh); check_scope(user, warehouse=to_wh)
     if not code:
         raise HTTPException(400, "零件编码必填")
-    if from_wh == to_wh and from_loc == to_loc and from_batch == to_batch:
-        raise HTTPException(400, "调出与调入库位/批次相同，不用调拨")
     conn = get_conn()
     try:
+        # P1-5：调出库位默认取调出仓库的默认库位；调入库位默认取调入仓库的默认库位（不再写死 A区-01 / B区-01）；
+        # 调出批次不填时取该库位最早有量的批次（FIFO），不再写死 BATCH-20261019
+        from_loc = payload.get("from_location") or warehouse_default_location(conn, from_wh)
+        to_loc = payload.get("to_location") or warehouse_default_location(conn, to_wh)
+        from_batch = payload.get("from_batch")
+        if not from_batch:
+            _brow = conn.execute("SELECT batch FROM stock WHERE part_code=? AND warehouse=? AND location=? AND qty>0 ORDER BY batch ASC LIMIT 1",
+                                 (code, from_wh, from_loc)).fetchone()
+            if not _brow:
+                raise HTTPException(400, f"调出库位无库存：{from_wh}/{from_loc}")
+            from_batch = _brow["batch"]
+        to_batch = payload.get("to_batch") or from_batch
+        if from_wh == to_wh and from_loc == to_loc and from_batch == to_batch:
+            raise HTTPException(400, "调出与调入库位/批次相同，不用调拨")
         fc = warehouse_company(conn, from_wh); tc = warehouse_company(conn, to_wh)
         if fc != tc:
             raise HTTPException(400, f"不能跨公司调拨：{from_wh}（{fc}）→ {to_wh}（{tc}），公司隔离")
@@ -1790,8 +1858,8 @@ def stock_transfer(payload: Dict[str, Any], x_user: Optional[str] = Header(None)
         else:
             conn.execute("INSERT INTO stock (part_code,warehouse,location,batch,qty,company_code) VALUES (?,?,?,?,?,?)", (code, to_wh, to_loc, to_batch, qty, tc))
         note = f"从 {from_wh}/{from_loc}/{from_batch} 调到 {to_wh}/{to_loc}/{to_batch}"
-        add_ledger(code, -qty, "调拨出", payload.get("ref_no", "调拨"), note, from_wh, from_batch, conn=conn)
-        add_ledger(code, qty, "调拨入", payload.get("ref_no", "调拨"), note, to_wh, to_batch, conn=conn)
+        add_ledger(code, -qty, "调拨出", payload.get("ref_no", "调拨"), note, from_wh, from_batch, conn=conn, location=from_loc, operator=user)
+        add_ledger(code, qty, "调拨入", payload.get("ref_no", "调拨"), note, to_wh, to_batch, conn=conn, location=to_loc, operator=user)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -1808,13 +1876,15 @@ def stock_count(payload: Dict[str, Any], x_user: Optional[str] = Header(None)):
     require_perm(user, "库存", "edit")
     code = payload.get("part_code", "")
     counted = num_field(payload.get("counted_qty"), "实盘数量", required=True)
-    warehouse = payload.get("warehouse", "主仓"); location = payload.get("location") or DEFAULT_LOCATION
-    batch = payload.get("batch") or DEFAULT_BATCH
+    warehouse = payload.get("warehouse", "主仓")
     check_scope(user, warehouse=warehouse)
     if not code:
         raise HTTPException(400, "零件编码必填")
     conn = get_conn()
     try:
+        # P1-5：库位默认取仓库默认库位，批次默认当天日期批次
+        location = payload.get("location") or warehouse_default_location(conn, warehouse)
+        batch = payload.get("batch") or today_batch()
         row = conn.execute("SELECT * FROM stock WHERE part_code=? AND warehouse=? AND location=? AND batch=?", (code, warehouse, location, batch)).fetchone()
         old = float(row["qty"]) if row else 0
         diff = counted - old
@@ -1824,7 +1894,7 @@ def stock_count(payload: Dict[str, Any], x_user: Optional[str] = Header(None)):
         else:
             conn.execute("INSERT INTO stock (part_code,warehouse,location,batch,qty,company_code) VALUES (?,?,?,?,?,?)", (code, warehouse, location, batch, counted, comp))
         if abs(diff) > 1e-9:
-            add_ledger(code, diff, "盘点", payload.get("ref_no", "盘点"), f"盘点：账面 {old} → 实盘 {counted}，差异 {diff}", warehouse, batch, conn=conn)
+            add_ledger(code, diff, "盘点", payload.get("ref_no", "盘点"), f"盘点：账面 {old} → 实盘 {counted}，差异 {diff}", warehouse, batch, conn=conn, location=location, operator=user)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -2616,8 +2686,9 @@ def purchase_receive(r: ReceiveIn, x_user: Optional[str] = Header(None)):
         conn.close()
         raise HTTPException(400, "到货数量超过采购数量")
     wh = r.warehouse or po["warehouse"]
-    batch = r.batch or DEFAULT_BATCH
-    location = r.location or DEFAULT_LOCATION
+    # P1-5：到货可手填库位/批次，不填就用该仓库默认库位+当天日期批次（不再写死 A区-01 / BATCH-20261019）
+    location = r.location or warehouse_default_location(conn, wh)
+    batch = r.batch or today_batch()
     try:
         conn.execute("UPDATE purchase_order_items SET received_qty=received_qty+? WHERE id=?", (r.qty, item["id"]))
         items2 = conn.execute("SELECT * FROM purchase_order_items WHERE order_no=?", (r.order_no,)).fetchall()
@@ -2637,9 +2708,10 @@ def purchase_receive(r: ReceiveIn, x_user: Optional[str] = Header(None)):
             # 质检不合格：不进可用库存，按“这次到货的批次/库位”整批冻结（P1-5：批次不再写死）
             conn.execute("INSERT INTO frozen_stock (part_code,qty,reason,ref_no,created_at,warehouse,location,batch,company_code) VALUES (?,?,?,?,?,?,?,?,?)",
                          (r.part_code, float(r.qty), "质检不合格冻结", r.order_no, now_str(), wh, location, batch, po["company_code"]))
-            add_ledger(r.part_code, 0, "质检不合格", r.order_no, f"到货 {r.qty} 质检不合格，已冻结（{wh}/{batch}）", wh, batch, po["company_code"], conn=conn)
+            add_ledger(r.part_code, 0, "质检不合格", r.order_no, f"到货 {r.qty} 质检不合格，已冻结（{wh}/{batch}）", wh, batch, po["company_code"], conn=conn, location=location, operator=user)
         else:
-            adjust_stock(r.part_code, float(r.qty), "采购入库", r.order_no, wh, location, batch, po["company_code"], conn=conn)
+            # P2-5：入库流水记下采购单价，给入库表导出的“单价/金额”用
+            adjust_stock(r.part_code, float(r.qty), "采购入库", r.order_no, wh, location, batch, po["company_code"], conn=conn, operator=user, unit_price=float(item["price"] or 0))
         conn.commit()
     except Exception:
         conn.rollback()
@@ -2696,13 +2768,67 @@ def list_production(company_code: Optional[str] = None, warehouse: Optional[str]
 
 @app.get("/api/production/{order_no}/consumptions")
 def list_consumptions(order_no: str, x_user: Optional[str] = Header(None)):
-    """某生产单的领料成本明细（大白话：这张单领了哪些料、每种花了多少钱）。"""
+    """某生产单的领料成本明细（大白话：这张单领了哪些料、每种花了多少钱）。含 P2-6 的部门/用途。"""
     user = resolve_user(x_user)
     require_perm(user, "生产", "view")
     conn = get_conn()
     rows = conn.execute("SELECT * FROM production_consumptions WHERE order_no=? ORDER BY id", (order_no,)).fetchall()
     conn.close()
     return [row_to_dict(r) for r in rows]
+
+def kitting_for_order(conn, order_no: str) -> Dict[str, Any]:
+    """算一张生产单的齐套（大白话：这张单要的料，现在手头到齐了几成，P2-6 4c）。
+    口径（和领料/生产缺料同一口径）：
+    - 按 BOM 直接子件逐项算：需求量 need = 单件用量 × 生产数量；
+    - 本单可用 = 全局可用量（现有+在途-已分配-冻结）+ 本单自己的占用（占用本来就是给本单留的）；
+    - 在制不算可用（P2-6 4b）：正在生产、还没完工入库的量不在库存里，自然不进可用量，本函数也不另外加；
+    - 到齐率（按数量）= Σ min(本单可用, 需求) ÷ Σ 需求 × 100%；另给“到齐项数/总项数”供看板参考。
+    """
+    mo = conn.execute("SELECT * FROM production_orders WHERE order_no=?", (order_no,)).fetchone()
+    if not mo:
+        raise HTTPException(404, f"生产单 {order_no} 不存在")
+    warehouse = mo["warehouse"]; company_code = mo["company_code"]
+    items = []
+    total_need = 0.0
+    total_ready = 0.0
+    ready_items = 0
+    for ch in direct_bom_children(conn, mo["product_code"], float(mo["qty"])):
+        need = float(ch["qty"])
+        avail = get_available(ch["part_code"], warehouse, company_code)
+        own = float(conn.execute("SELECT COALESCE(SUM(qty),0) FROM allocations WHERE ref_no=? AND part_code=?",
+                                 (order_no, ch["part_code"])).fetchone()[0] or 0)
+        can = avail + own
+        shortage = max(0.0, need - can)
+        is_ready = can + 1e-9 >= need
+        if is_ready:
+            ready_items += 1
+        total_need += need
+        total_ready += min(can, need)
+        part = conn.execute("SELECT name,unit FROM parts WHERE code=?", (ch["part_code"],)).fetchone()
+        items.append({"part_code": ch["part_code"], "part_name": part["name"] if part else "",
+                      "unit": part["unit"] if part else "", "need": need,
+                      "available": round(can, 4), "shortage": round(shortage, 4),
+                      "is_ready": is_ready, "is_subassembly": bool(ch["is_subassembly"])})
+    rate = round(100.0 * total_ready / total_need, 2) if total_need > 1e-9 else 100.0
+    return {"order_no": order_no, "product_code": mo["product_code"], "qty": float(mo["qty"]),
+            "status": mo["status"], "warehouse": warehouse, "company_code": company_code,
+            "kitting_rate": rate, "ready_items": ready_items, "total_items": len(items),
+            "items": items}
+
+@app.get("/api/production/{order_no}/kitting")
+def production_kitting(order_no: str, x_user: Optional[str] = Header(None)):
+    """齐套查询（大白话：这张生产单要的料，现在到齐了几成、还缺哪几种）。P2-6 4c。"""
+    user = resolve_user(x_user)
+    require_perm(user, "生产", "view")
+    conn = get_conn()
+    mo = conn.execute("SELECT * FROM production_orders WHERE order_no=?", (order_no,)).fetchone()
+    if not mo:
+        conn.close()
+        raise HTTPException(404, f"生产单 {order_no} 不存在")
+    check_scope(user, warehouse=mo["warehouse"], company_code=mo["company_code"])
+    d = kitting_for_order(conn, order_no)
+    conn.close()
+    return d
 
 def _allocate_for_production(conn, order_no: str, product_code: str, qty: float, warehouse: str = "主仓", company_code: str = "COMP-001"):
     """生产单创建时占用库存（大白话：先把料占上，别人就不能重复算这批料）。
@@ -2773,10 +2899,14 @@ def production_consume(payload: Dict[str, Any], x_user: Optional[str] = Header(N
     2) 直接子件是半成品时：先扣半成品库存；半成品不够时不扣其底层原材料，本次领料失败并返回缺口，
        提示先用 /api/production/{单号}/ensure-subassemblies 生成半成品生产单、先生半成品。
     3) 扣库存按批次 FIFO（先进先出），跳过被冻结的批次量；全部检查通过后一次性扣（原子操作）。
+    4) 领用部门/用途（P2-6 4a，用户选填）：payload 里 dept（领用部门）、purpose（用途），选填，
+       会随领料明细一起存进 production_consumptions，方便对账时查“哪部门领的、干嘛用的”。
     """
     user = resolve_user(x_user)
     require_perm(user, "生产", "edit")
     order_no = payload.get("order_no", "")
+    dept = str(payload.get("dept") or "").strip()
+    purpose = str(payload.get("purpose") or "").strip()
     conn = get_conn()
     mo = conn.execute("SELECT * FROM production_orders WHERE order_no=?", (order_no,)).fetchone()
     if not mo:
@@ -2823,10 +2953,11 @@ def production_consume(payload: Dict[str, Any], x_user: Optional[str] = Header(N
             if take <= 1e-9:
                 continue
             conn.execute("UPDATE stock SET qty=qty-? WHERE id=?", (take, row["id"]))
-            conn.execute("INSERT INTO stock_ledger (part_code,warehouse,batch,change_qty,type,ref_no,remark,created_at,company_code) VALUES (?,?,?,?,?,?,?,?,?)",
-                         (part_code, warehouse, row["batch"], -take, "生产领料", order_no, f"生产领料 {take}（逐级）", now_str(), company_code))
-            conn.execute("INSERT INTO production_consumptions (order_no,part_code,qty,unit_cost,total_cost,batch,warehouse,company_code,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                         (order_no, part_code, take, unit_cost, round(take * unit_cost, 2), row["batch"], warehouse, company_code, now_str()))
+            # P2-5：领料流水记下真实库位/经办人/单位成本；P2-6：领料明细记下部门/用途
+            conn.execute("INSERT INTO stock_ledger (part_code,warehouse,location,batch,change_qty,type,ref_no,operator,unit_price,remark,created_at,company_code) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                         (part_code, warehouse, row["location"], row["batch"], -take, "生产领料", order_no, user, unit_cost, f"生产领料 {take}（逐级）", now_str(), company_code))
+            conn.execute("INSERT INTO production_consumptions (order_no,part_code,qty,unit_cost,total_cost,batch,warehouse,company_code,dept,purpose,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                         (order_no, part_code, take, unit_cost, round(take * unit_cost, 2), row["batch"], warehouse, company_code, dept, purpose, now_str()))
             consumed.append({"part_code": part_code, "qty": take, "batch": row["batch"], "unit_cost": unit_cost})
             remain -= take
         if remain > 1e-9:
@@ -2835,8 +2966,8 @@ def production_consume(payload: Dict[str, Any], x_user: Optional[str] = Header(N
     conn.execute("UPDATE production_orders SET status='已领料' WHERE order_no=?", (order_no,))
     conn.execute("DELETE FROM allocations WHERE ref_no=?", (order_no,))
     conn.commit(); conn.close()
-    log_audit(user, "领料", "生产单", order_no, "状态", "新建", "已领料", f"逐级领料 {len(consumed)} 条", company_code)
-    return {"ok": True, "order_no": order_no, "status": "已领料", "consumed": consumed}
+    log_audit(user, "领料", "生产单", order_no, "状态", "新建", "已领料", f"逐级领料 {len(consumed)} 条{('，部门：'+dept) if dept else ''}{('，用途：'+purpose) if purpose else ''}", company_code)
+    return {"ok": True, "order_no": order_no, "status": "已领料", "dept": dept, "purpose": purpose, "consumed": consumed}
 
 @app.post("/api/production/{order_no}/ensure-subassemblies")
 def ensure_subassemblies(order_no: str, x_user: Optional[str] = Header(None)):
@@ -2891,9 +3022,10 @@ def production_complete(payload: Dict[str, Any], x_user: Optional[str] = Header(
         raise HTTPException(400, f"生产单 {order_no} 状态是 {mo['status']}，请先领料再完工")
     conn.execute("UPDATE production_orders SET status='已完工' WHERE order_no=?", (order_no,))
     # P1-6：完工状态 + 成品入库 + 库存流水必须在同一个事务里，不能“状态已完工但入库失败”
+    # P1-5：成品入库不填库位/批次时用该仓库默认库位+当天日期批次
     try:
         adjust_stock(mo["product_code"], float(mo["qty"]), "生产入库", order_no, mo["warehouse"],
-                     DEFAULT_LOCATION, DEFAULT_BATCH, mo["company_code"], conn=conn)
+                     None, None, mo["company_code"], conn=conn, operator=user)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -2977,6 +3109,22 @@ def dashboard(x_user: Optional[str] = Header(None)):
                                   "planned_start": mo["planned_start"], "planned_end": mo["planned_end"],
                                   "missing": missing, "status": "红"})
     prod_status = "红" if prod_shortage else "绿"
+    # 6) P2-6 4c 齐套看板：新建生产单按单算到齐百分比（大白话：每张单的料到齐了几成），最低的排前面
+    kitting_items = []
+    for mo in mos:
+        try:
+            _conn_k = get_conn()
+            _kd = kitting_for_order(_conn_k, mo["order_no"])
+            _conn_k.close()
+            _rate = _kd["kitting_rate"]
+            kitting_items.append({"order_no": mo["order_no"], "product_code": mo["product_code"], "qty": mo["qty"],
+                                  "planned_start": mo["planned_start"], "planned_end": mo["planned_end"],
+                                  "kitting_rate": _rate, "ready_items": _kd["ready_items"], "total_items": _kd["total_items"],
+                                  "status": "绿" if _rate >= 100 - 1e-9 else "红"})
+        except Exception:
+            pass
+    kitting_items.sort(key=lambda x: x["kitting_rate"])
+    kit_status = "红" if any(x["kitting_rate"] < 100 - 1e-9 for x in kitting_items) else "绿"
     # 5) 第三阶段：智能补货建议（再订货点公式，见 /api/replenishment 注释；失败时不拖垮看板）
     try:
         conn_r = get_conn()
@@ -3000,6 +3148,8 @@ def dashboard(x_user: Optional[str] = Header(None)):
         "overdue_purchase": {"title": "拖期采购", "status": overdue_status, "count": len(overdue_items), "items": overdue_items},
         "supplier_ranking": {"title": "供应商拖期排行", "status": ranking_status, "count": len(ranking), "items": ranking},
         "production_shortage": {"title": "生产缺料", "status": prod_status, "count": len(prod_shortage), "items": prod_shortage},
+        "kitting": {"title": "齐套看板", "status": kit_status, "count": len(kitting_items), "items": kitting_items[:10],
+                    "formula": "到齐率(按数量)=Σmin(本单可用,需求)÷Σ需求×100%；在制不计入可用量"},
         # 兼容 MVP 的旧字段
         "low_stock": shortage_items,
         "pending_purchase": [row_to_dict(r) if hasattr(r, "keys") else r for r in pos],
@@ -3199,9 +3349,34 @@ def excel_export(kind: str, sales_order_no: Optional[str] = None, x_user: Option
         else:
             rows = conn.execute("SELECT sales_order_no,part_code,part_name,level,need_type,gross,onhand,in_transit,safety,net,adjusted_net,latest_order_date FROM mrp_results ORDER BY sales_order_no, level, part_code").fetchall()
         data = [list(r) for r in rows]
+    elif kind in ("stock_in", "stock_out"):
+        # P2-5 入库表 / 出库表（用户 2026-10-19 定的表头，见 字段字典.md）：
+        # 单号=RK/CK-流水号(stock_ledger.id)、日期=流水时间、类型映射到工厂常用说法、
+        # 数量取绝对值、金额=数量×单价、关联单号=业务单号（采购单/生产单/调拨号）
+        headers = ["单号", "日期", "类型", "仓库", "库位", "零件编码", "零件名称", "规格型号", "批次", "数量", "单价", "金额", "经办人", "关联单号", "备注"]
+        _is_in = kind == "stock_in"
+        if _is_in:
+            _cond = "(l.type IN ('采购入库','生产入库','期初','期初导入','其他入库','调拨入') OR (l.type='盘点' AND l.change_qty>0))"
+        else:
+            _cond = "(l.type IN ('生产领料','领料出库','其他出库','调拨出','销售出库') OR (l.type='盘点' AND l.change_qty<0))"
+        _rows = conn.execute(f"""
+            SELECT l.id,l.created_at,l.type,l.warehouse,l.location,l.part_code,p.name,p.spec,l.batch,l.change_qty,l.unit_price,l.operator,l.ref_no,l.remark
+            FROM stock_ledger l LEFT JOIN parts p ON p.code=l.part_code
+            WHERE {_cond}
+            ORDER BY l.id
+        """).fetchall()
+        _disp = {"生产领料": "领料出库", "调拨入": "调拨", "调拨出": "调拨", "期初": "期初入库", "期初导入": "期初入库"}
+        data = []
+        for _r in _rows:
+            _lid, _created, _typ, _wh, _loc, _code, _pname, _spec, _batch, _chg, _price, _op, _ref, _remark = _r
+            _qty = abs(float(_chg or 0))
+            _disp_type = ("盘点入库" if _chg > 0 else "盘点出库") if _typ == "盘点" else _disp.get(_typ, _typ)
+            data.append([f"{'RK' if _is_in else 'CK'}-{str(_lid).zfill(6)}", _created, _disp_type, _wh, _loc or "", _code,
+                         _pname or "", _spec or "", _batch or "", _qty, float(_price or 0), round(_qty * float(_price or 0), 2),
+                         _op or "", _ref or "", _remark or ""])
     else:
         conn.close()
-        raise HTTPException(404, f"导出 {kind} 不存在，可选 parts/stock/purchase/bom/supplier/sales/production/mrp/stock_balance/purchase_summary/production_summary/payable/audit_log")
+        raise HTTPException(404, f"导出 {kind} 不存在，可选 parts/stock/purchase/bom/supplier/sales/production/mrp/stock_in/stock_out/stock_balance/purchase_summary/production_summary/payable/audit_log")
     conn.close()
     return _excel_response(rows_to_excel(headers, data, sheet_name=kind), f"export_{kind}.xlsx")
 
@@ -3293,7 +3468,8 @@ async def excel_import(kind: str, file: UploadFile = File(...), sheet: Optional[
                 except ValueError:
                     errors.append(f"第 {i} 行：数量不是数字"); continue
                 warehouse = str(get(row, "warehouse", default="主仓") or "主仓")
-                location = str(get(row, "location", default="A区-01") or "A区-01")
+                # P1-5：导入表里没给库位时用该仓库的默认库位，不再写死 A区-01
+                location = str(get(row, "location", default="") or "") or warehouse_default_location(conn, warehouse)
                 batch = str(get(row, "batch", default="BATCH-IMPORT") or "BATCH-IMPORT")
                 comp = str(get(row, "company_code", default="") or "") or warehouse_company(conn, warehouse)
                 existing = conn.execute("SELECT id,qty FROM stock WHERE part_code=? AND warehouse=? AND location=? AND batch=?", (code, warehouse, location, batch)).fetchone()
@@ -3304,8 +3480,8 @@ async def excel_import(kind: str, file: UploadFile = File(...), sheet: Optional[
                     delta = qty
                     conn.execute("INSERT INTO stock (part_code,warehouse,location,batch,qty,company_code) VALUES (?,?,?,?,?,?)", (code, warehouse, location, batch, qty, comp))
                 if delta != 0:
-                    conn.execute("INSERT INTO stock_ledger (part_code,warehouse,batch,change_qty,type,ref_no,remark,created_at,company_code) VALUES (?,?,?,?,?,?,?,?,?)",
-                                 (code, warehouse, batch, delta, "期初导入", "Excel导入", "Excel导入库存", now_str(), comp))
+                    conn.execute("INSERT INTO stock_ledger (part_code,warehouse,location,batch,change_qty,type,ref_no,operator,remark,created_at,company_code) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                                 (code, warehouse, location, batch, delta, "期初导入", "Excel导入", user, "Excel导入库存", now_str(), comp))
                 imported += 1
         elif kind == "purchase":
             if "order_no" not in mapping:
@@ -3602,9 +3778,10 @@ def create_warehouse(payload: Dict[str, Any], x_user: Optional[str] = Header(Non
         conn.close()
         raise HTTPException(404, f"公司 {payload.get('company_code')} 不存在")
     try:
-        conn.execute("INSERT INTO warehouses (code,name,company_code,type,address,created_at) VALUES (?,?,?,?,?,?)",
+        conn.execute("INSERT INTO warehouses (code,name,company_code,type,address,default_location,created_at) VALUES (?,?,?,?,?,?,?)",
                      (code, payload.get("name"), payload.get("company_code", "COMP-001"),
-                      payload.get("type", "综合"), payload.get("address", ""), now_str()))
+                      payload.get("type", "综合"), payload.get("address", ""),
+                      (payload.get("default_location") or "A区-01"), now_str()))
         conn.commit()
     except sqlite3.IntegrityError:
         conn.close()
@@ -3612,6 +3789,29 @@ def create_warehouse(payload: Dict[str, Any], x_user: Optional[str] = Header(Non
     conn.close()
     log_audit(user, "创建", "仓库", code, "名称", "", str(payload.get("name")), f"公司 {payload.get('company_code','COMP-001')}")
     return {"ok": True, "code": code}
+
+@app.put("/api/warehouses/{code}")
+def update_warehouse(code: str, payload: Dict[str, Any], x_user: Optional[str] = Header(None)):
+    """修改仓库（大白话：改个仓库的名字、默认库位这类基本信息；默认库位就是入库不填库位时进的地方，P1-5）。"""
+    user = resolve_user(x_user)
+    require_perm(user, "系统", "edit")
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM warehouses WHERE code=?", (code,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(404, f"仓库 {code} 不存在")
+    fields = {}
+    for k in ("name", "type", "address", "default_location"):
+        if k in payload and payload.get(k) is not None:
+            fields[k] = payload.get(k)
+    if not fields:
+        conn.close()
+        raise HTTPException(400, "没有要修改的字段（可改 name/type/address/default_location）")
+    sets = ", ".join(f"{k}=?" for k in fields)
+    conn.execute(f"UPDATE warehouses SET {sets} WHERE code=?", list(fields.values()) + [code])
+    conn.commit(); conn.close()
+    log_audit(user, "修改", "仓库", code, "字段", "", str({k: v for k, v in fields.items()}), "")
+    return {"ok": True, "code": code, "updated": list(fields.keys())}
 
 @app.get("/api/currencies")
 def list_currencies(x_user: Optional[str] = Header(None)):

@@ -191,6 +191,13 @@ check("请问" in r.json()["answer"] or "比如" in r.json()["answer"], "助手�
 # ===== 6. 模拟表单导入（已填好文件 4 页） =====
 data = open(FORMS, "rb").read()
 check(os.path.exists(FORMS), f"模拟表单存在：{FORMS}")
+# 第四轮迭代（P1-5）说明：到货不填批次改为按当天日期生成批次后，前面章节的库存会分散在多个批次行里，
+# 而“库存期初导入”是按（零件+仓库+库位+批次）逐行覆盖的，基线不再自动等于导入数。
+# 本节模拟的是“新账套期初”场景，导入前先清掉前面章节的库存行，让期初基线只由导入数据决定。
+import sqlite3 as _sql3
+_conn6 = _sql3.connect(app_module.DB_PATH)
+_conn6.execute("DELETE FROM stock")
+_conn6.commit(); _conn6.close()
 for kind, sheet, want in [("parts", "零件", 10), ("stock", "库存期初", 10), ("bom", "BOM", 12), ("purchase", "采购", 1)]:
     r = client.post(f"/api/excel/import/{kind}?sheet={sheet}", headers=H(ADMIN),
                     files={"file": ("模拟数据-已填好.xlsx", io.BytesIO(data), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
