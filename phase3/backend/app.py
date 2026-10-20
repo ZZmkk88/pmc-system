@@ -43,7 +43,8 @@ from pydantic import BaseModel
 
 # 大白话：数据库文件路径，第二阶段仍用 SQLite 单文件，放在 backend 目录下
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "pmc_phase3.db")
+# 打包/便携场景允许用 PMC_DB_PATH 指定数据库位置（一键启动入口、自检脚本用）；未设置时仍放 backend 目录
+DB_PATH = os.environ.get("PMC_DB_PATH") or os.path.join(BASE_DIR, "pmc_phase3.db")
 TODAY = date.today().isoformat()
 
 app = FastAPI(title="PMC 系统 第三阶段", description="生产物料控制（大白话：管缺啥料、买多少、什么时候买）第三阶段：简单登录+智能补货+供应商自动推荐+助手查询+移动端适配")
@@ -1882,9 +1883,15 @@ def stock_count(payload: Dict[str, Any], x_user: Optional[str] = Header(None)):
         raise HTTPException(400, "零件编码必填")
     conn = get_conn()
     try:
-        # P1-5：库位默认取仓库默认库位，批次默认当天日期批次
+        # P1-5：库位默认取仓库默认库位。
+        # 盘点不指定批次时，必须落在“该库位已有库存的批次”上：否则会凭空新建当天批次，
+        # 旧批次数量不扣、库存被重复计算（实测：20 件盘成 100 件后总数变 120）。
         location = payload.get("location") or warehouse_default_location(conn, warehouse)
-        batch = payload.get("batch") or today_batch()
+        batch = payload.get("batch")
+        if not batch:
+            _brow = conn.execute("SELECT batch FROM stock WHERE part_code=? AND warehouse=? AND location=? AND qty>0 ORDER BY batch ASC LIMIT 1",
+                                 (code, warehouse, location)).fetchone()
+            batch = _brow["batch"] if _brow else today_batch()
         row = conn.execute("SELECT * FROM stock WHERE part_code=? AND warehouse=? AND location=? AND batch=?", (code, warehouse, location, batch)).fetchone()
         old = float(row["qty"]) if row else 0
         diff = counted - old
@@ -4677,7 +4684,9 @@ def assistant_examples():
 @app.get("/health")
 def health():
     # 必须放在静态文件挂载之前，否则 /health 会被静态文件路由吞掉返回 404
-    return {"ok": True, "msg": "PMC 第三阶段运行正常"}
+    # app_id/data_dir 供一键启动入口严格识别“这是不是 PMC 的服务、是不是这套数据库的实例”
+    return {"ok": True, "app_id": "pmc-phase3", "msg": "PMC 第三阶段运行正常",
+            "data_dir": os.path.dirname(os.path.abspath(DB_PATH))}
 
 # ---------- 静态前端 ----------
 FRONTEND_DIR = os.path.join(os.path.dirname(BASE_DIR), "frontend")

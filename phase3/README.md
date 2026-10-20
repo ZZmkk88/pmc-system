@@ -6,10 +6,10 @@
 
 ## 怎么跑
 
-### Windows（推荐：双击 `启动PMC系统.bat`）
+### Windows（推荐：双击 `启动PMC系统.vbs`）
 
-1. 双击 `phase3\启动PMC系统.bat`：自动建 `.venv`、装依赖、启动服务，3 秒后自动开浏览器。
-2. 浏览器地址 http://127.0.0.1:8000 ，账号 `admin / admin`，首次登录会要求改密码。
+1. 双击 `phase3\启动PMC系统.vbs`（或用桌面上的「PMC系统」快捷方式）：自动启动服务，等就绪后让你选浏览器并打开页面。
+2. 浏览器地址 http://127.0.0.1:8000 ，账号 `admin / admin`，首次登录会要求改密码。启动日志见 `phase3\logs\startup.log`。
 
 ### 命令行（Windows / macOS / Linux）
 
